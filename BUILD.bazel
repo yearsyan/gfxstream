@@ -1,0 +1,35 @@
+load("@rules_license//rules:license.bzl", "license")
+
+package_group(
+    name = "gfxstream",
+    packages = [
+        "//...",
+    ],
+)
+
+package(
+    default_applicable_licenses = [":gfxstream_license"],
+    default_visibility = ["//:gfxstream"],
+)
+
+exports_files(
+    ["LICENSE"],
+    visibility = ["//visibility:public"],
+)
+
+license(
+    name = "gfxstream_license",
+    package_name = "gfxstream",
+    copyright_notice = "Copyright 2024 - The Android Open Source Project",
+    license_kinds = [
+        "@rules_license//licenses/spdx:Apache-2.0",
+        "@rules_license//licenses/spdx:BSD-3-Clause",
+        "@rules_license//licenses/spdx:ISC",
+        "@rules_license//licenses/spdx:MIT",
+    ],
+    license_text = "LICENSE",
+    package_url = "https://android.googlesource.com/platform/hardware/google/gfxstream/",
+    visibility = ["//visibility:public"],
+)
+
+licenses(["notice"])

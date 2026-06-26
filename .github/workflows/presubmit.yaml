@@ -1,0 +1,102 @@
+name: Gfxstream Presubmit
+
+on:
+  pull_request:
+  push:
+    branches-ignore:
+      - main  # push events to main branch occur after PRs are merged, when the same checks were run
+
+concurrency:
+  # limits the workflow to a single run per branch/PR
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # previous runs are cancelled when a new run is started
+  cancel-in-progress: true
+
+jobs:
+  run-gfxstream-bazel-tests:
+    uses: ./.github/workflows/presubmit_bazel.yml
+    with:
+      runner: ubuntu-22.04
+
+  run-gfxstream-bazel-tests-asan:
+    uses: ./.github/workflows/presubmit_bazel.yml
+    with:
+      # TODO(b/475886246): fix and remove `detect_leaks=0`
+      # TODO(b/475885975): fix and remove `detect_odr_violation=0`
+      additional-bazel-args: --config=asan --test_env="ASAN_OPTIONS=detect_leaks=0:detect_odr_violation=0"
+      runner: ubuntu-22.04
+
+  run-gfxstream-bazel-tests-arm:
+    uses: ./.github/workflows/presubmit_bazel.yml
+    with:
+      runner: ubuntu-22.04-arm
+      # The arm runner is too slow:
+      run-tests: false
+
+  run-gfxstream-cmake-build:
+    runs-on: ubuntu-22.04
+    steps:
+    - name: Free disk space
+      uses: jlumbroso/free-disk-space@v1.3.1
+      with:
+        tool-cache: true
+    - name: Checkout repository
+      uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8  # v6.0.1
+    - name: Install toolchain dependencies
+      run: sudo bash toolchain/cmake/install_toolchain_dependencies.sh
+    - name: Configure Build
+      run: |
+        mkdir build && \
+        cd build && \
+        cmake .. -G Ninja
+    - name: Build
+      run: |
+        cd build && \
+        ninja
+
+  run-gfxstream-meson-build:
+    runs-on: ubuntu-22.04
+    steps:
+    - name: Free disk space
+      uses: jlumbroso/free-disk-space@v1.3.1
+      with:
+        tool-cache: true
+    - name: Checkout repository
+      uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8  # v6.0.1
+    - name: Install toolchain dependencies
+      run: sudo bash toolchain/meson/install_toolchain_dependencies.sh
+    - name: Configure Build
+      run: |
+        meson setup \
+          -Ddefault_library=static \
+          -Dgfxstream-build=host \
+          build
+    - name: Build
+      run: |
+        meson compile -C build
+
+  run-gfxstream-meson-build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Checkout current PR branch
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: |
+            git
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-toolchain
+            mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-meson
+            mingw-w64-ucrt-x86_64-headers-git
+      - name: Configure Build
+        run: meson setup build
+      - name: Build
+        run: meson compile -C build
