@@ -17,11 +17,14 @@
 
 #include <functional>
 #include <future>
+#include <memory>
 #include <optional>
 #include <unordered_map>
 #include <vector>
 
+#include "color_buffer.h"
 #include "compositor.h"
+#include "handle.h"
 #include "hwc2.h"
 #include "post_commands.h"
 #include "gfxstream/Compiler.h"
@@ -41,7 +44,8 @@ class PostWorker {
 
     // post: posts the next color buffer.
     // Assumes framebuffer lock is held.
-    void post(ColorBuffer* cb, std::unique_ptr<Post::CompletionCallback> postCallback,
+    void post(std::shared_ptr<ColorBuffer> cb, HandleType cbHandle,
+              std::unique_ptr<Post::CompletionCallback> postCallback,
               const std::optional<std::array<float, 16>>& colorTransform);
 
     // viewport: (re)initializes viewport dimensions.
@@ -54,6 +58,7 @@ class PostWorker {
     // called when the CPU side job completes. The passed in future in the
     // callback will be completed when the GPU opereation completes.
     void compose(std::unique_ptr<FlatComposeRequest> composeRequest,
+                 Post::ColorBufferRefMap colorBufferRefs,
                  std::unique_ptr<Post::CompletionCallback> composeCallback);
 
     // clear: blanks out emulator display when refreshing the subwindow
@@ -69,18 +74,28 @@ class PostWorker {
     // until continueSignal is ready before completes.
     void block(std::promise<void> scheduledSignal, std::future<void> continueSignal);
 
+    // exportDisplay: MacMu IOSurface export of one display's bound
+    // ColorBuffer (see PostCmd::MacMuExportDisplay).
+    void exportDisplay(uint32_t displayId);
+
     // Exit post worker, unbind gl context if necessary.
     void exit();
 
    protected:
     void runTask(std::packaged_task<void()>);
     // Impl versions of the above, so we can run it from separate threads
-    virtual std::shared_future<void> postImpl(ColorBuffer* cb,
+    virtual std::shared_future<void> postImpl(std::shared_ptr<ColorBuffer> cb, HandleType cbHandle,
               const std::optional<std::array<float, 16>>& colorTransform) = 0;
     virtual void viewportImpl(int width, int height) = 0;
     virtual void clearImpl() = 0;
     virtual void exitImpl() = 0;
-    virtual std::shared_future<void> composeImpl(const FlatComposeRequest& composeRequest);
+    virtual std::shared_future<void> composeImpl(
+        const FlatComposeRequest& composeRequest,
+        const Post::ColorBufferRefMap& colorBufferRefs);
+    virtual ColorBuffer::UsedApi getColorBufferUsedApi() const = 0;
+    // Default: not supported (Vulkan post workers do not export secondary
+    // displays yet).
+    virtual void exportDisplayImpl(uint32_t displayId) { (void)displayId; }
 
    protected:
     FrameBuffer* mFb;

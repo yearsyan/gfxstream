@@ -31,6 +31,7 @@ struct BorrowedImageInfoVk : public BorrowedImageInfo {
     VkImageView imageView = VK_NULL_HANDLE;
     VkImageCreateInfo imageCreateInfo = {};
     GfxstreamFormat imageFormat = GfxstreamFormat::UNKNOWN;
+    bool exportableToMetalIosurface = false;
 
     // The image layout that `image` is in before composition.
     //

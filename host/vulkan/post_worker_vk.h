@@ -32,12 +32,14 @@ class PostWorkerVk : public PostWorker {
    public:
     PostWorkerVk(FrameBuffer* fb, Compositor* compositor, vk::DisplayVk* displayGl);
 
-   protected:
+    protected:
     std::shared_future<void> postImpl(
-        ColorBuffer* cb, const std::optional<std::array<float, 16>>& colorTransform) override;
+        std::shared_ptr<ColorBuffer> cb, HandleType cbHandle,
+        const std::optional<std::array<float, 16>>& colorTransform) override;
     void viewportImpl(int width, int height) override;
     void clearImpl() override;
     void exitImpl() override;
+    ColorBuffer::UsedApi getColorBufferUsedApi() const override { return ColorBuffer::UsedApi::kVk; }
 
    private:
     // TODO(b/233939967): conslidate DisplayGl and DisplayVk into

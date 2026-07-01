@@ -19,6 +19,7 @@
 #include <future>
 #include <memory>
 #include <optional>
+#include <unordered_map>
 #include <vector>
 
 #include "gfxstream/host/display_operations.h"
@@ -40,9 +41,14 @@ enum class PostCmd {
     Screenshot = 4,
     Exit = 5,
     Block = 6,
+    // MacMu: export one display's bound ColorBuffer to its IOSurface
+    // frame-channel slot (fired per guest frame via display buffer re-binds).
+    MacMuExportDisplay = 7,
 };
 
 struct Post {
+    using ColorBufferRefMap = std::unordered_map<HandleType, std::shared_ptr<ColorBuffer>>;
+
     struct Block {
         // schduledSignal will be set when the block task is scheduled.
         std::promise<void> scheduledSignal;
@@ -57,6 +63,8 @@ struct Post {
     std::unique_ptr<CompletionCallback> completionCallback = nullptr;
     std::unique_ptr<Block> block = nullptr;
     HandleType cbHandle = 0;
+    std::shared_ptr<ColorBuffer> cbRef = nullptr;
+    ColorBufferRefMap colorBufferRefs;
     std::optional<std::array<float, 16>> colorTransform;
 
     //TODO: remove union here and separate into message structures
@@ -66,6 +74,9 @@ struct Post {
             int width;
             int height;
         } viewport;
+        struct {
+            uint32_t displayId;
+        } exportDisplay;
         struct {
             ColorBuffer* cb;
             int screenwidth;

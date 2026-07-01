@@ -33,6 +33,7 @@
 #include "gfxstream/containers/StaticMap.h"
 #include "gfxstream/host/display_operations.h"
 #include "gfxstream/host/gfxstream_format.h"
+#include "gfxstream/host/iosurface_export.h"
 #include "gfxstream/host/vm_operations.h"
 #include "gfxstream/synchronization/Lock.h"
 #include "gfxstream/system/System.h"
@@ -76,6 +77,10 @@ constexpr size_t kPageBits = 12;
 constexpr size_t kPageSize = 1u << kPageBits;
 
 static std::optional<std::string> sMemoryLogPath = std::nullopt;
+
+bool isMacMuIosurfaceExportEnabled() {
+    return gfxstream::host::isIosurfaceExportEnabled();
+}
 
 const char* string_AstcEmulationMode(AstcEmulationMode mode) {
     switch (mode) {
@@ -1729,9 +1734,15 @@ void VkEmulation::initFeatures(Features features) {
         }
     }
 
-    if (features.useVulkanNativeSwapchain) {
+    const bool useMacMuIosurfaceDisplay =
+        features.useVulkanComposition && isMacMuIosurfaceExportEnabled();
+    if (features.useVulkanNativeSwapchain || useMacMuIosurfaceDisplay) {
         if (mDisplayVk) {
             GFXSTREAM_ERROR("Reset VkEmulation::displayVk.");
+        }
+        if (useMacMuIosurfaceDisplay && !features.useVulkanNativeSwapchain) {
+            GFXSTREAM_INFO(
+                "MACMU_IOSURFACE_EXPORT creating DisplayVk for headless IOSurface export.");
         }
         mDisplayVk = std::make_unique<DisplayVk>(
             *mIvk, mPhysicalDevice, mDevice, mCompositorVk.get(), mQueueFamilyIndex, mQueue,
@@ -2913,6 +2924,8 @@ bool VkEmulation::createVkColorBufferLocked(uint32_t width, uint32_t height,
     imageCi->pQueueFamilyIndices = nullptr;
     imageCi->initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
+    auto vk = mDvk;
+
     // Create the image
     VkExternalMemoryImageCreateInfo extImageCi = {
         VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO
@@ -2925,8 +2938,6 @@ bool VkEmulation::createVkColorBufferLocked(uint32_t width, uint32_t height,
 
         imageCi->pNext = &extImageCi;
     }
-
-    auto vk = mDvk;
 
     VkResult createRes = vk->vkCreateImage(mDevice, imageCi.get(), nullptr, &infoPtr->image);
     if (createRes != VK_SUCCESS) {
@@ -4939,6 +4950,7 @@ std::unique_ptr<BorrowedImageInfoVk> VkEmulation::borrowColorBufferForCompositio
     compositorInfo->imageView = colorBufferInfo->imageView;
     compositorInfo->imageCreateInfo = colorBufferInfo->imageCreateInfoShallow;
     compositorInfo->imageFormat = colorBufferInfo->format;
+    compositorInfo->exportableToMetalIosurface = colorBufferInfo->exportableToMetalIosurface;
     compositorInfo->preBorrowLayout = colorBufferInfo->currentLayout;
     compositorInfo->preBorrowQueueFamilyIndex = colorBufferInfo->currentQueueFamilyIndex;
     if (colorBufferIsTarget && mDisplayVk) {
@@ -4981,6 +4993,7 @@ std::unique_ptr<BorrowedImageInfoVk> VkEmulation::borrowColorBufferForDisplay(
     compositorInfo->imageView = colorBufferInfo->imageView;
     compositorInfo->imageCreateInfo = colorBufferInfo->imageCreateInfoShallow;
     compositorInfo->imageFormat = colorBufferInfo->format;
+    compositorInfo->exportableToMetalIosurface = colorBufferInfo->exportableToMetalIosurface;
     compositorInfo->preBorrowLayout = colorBufferInfo->currentLayout;
     compositorInfo->preBorrowQueueFamilyIndex = mQueueFamilyIndex;
 

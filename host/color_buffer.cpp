@@ -633,6 +633,7 @@ bool ColorBuffer::Impl::glOpPostViewportScaledWithOverlay(
     mColorBufferGl->postViewportScaledWithOverlay(rotation, dx, dy, scaleX, scaleY, colorTransform);
     return true;
 }
+
 #endif
 
 ////////////////////////////////////////////////////////////////////////////////////////////////

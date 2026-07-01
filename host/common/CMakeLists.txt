@@ -36,6 +36,7 @@ if (NOT TARGET gfxstream_host_common)
         file_stream.cpp
         graphics_driver_lock.cpp
         guest_operations.cpp
+        iosurface_export.cpp
         mem_stream.cpp
         renderer_operations.cpp
         stream_utils.cpp
@@ -52,5 +53,23 @@ if (NOT TARGET gfxstream_host_common)
         gfxstream_host_address_space
         gfxstream_common_logging
         )
+    if (APPLE)
+        target_link_libraries(
+            gfxstream_host_common
+            PRIVATE
+            "-framework CoreFoundation"
+            "-framework IOSurface"
+            )
+    endif()
 endif()
 
+if (APPLE AND NOT TARGET gfxstream_iosurface_export_unittests)
+    add_executable(
+        gfxstream_iosurface_export_unittests
+        EXCLUDE_FROM_ALL
+        iosurface_export_unittest.cpp)
+    target_link_libraries(
+        gfxstream_iosurface_export_unittests
+        PRIVATE
+        gfxstream_host_common)
+endif()

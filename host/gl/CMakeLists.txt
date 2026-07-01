@@ -37,6 +37,7 @@ add_library(gfxstream-gl-server
             emulated_egl_window_surface.cpp
             emulation_gl.cpp
             gles_version_detector.cpp
+            iosurface_gl_export.cpp
             pixel_read_formats.cpp
             readback_worker_gl.cpp
             render_thread_info_gl.cpp

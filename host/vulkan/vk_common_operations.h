@@ -342,6 +342,7 @@ class VkEmulation {
 
         bool glExported = false;
         bool externalMemoryCompatible = false;
+        bool exportableToMetalIosurface = false;
 
         VulkanMode vulkanMode = VulkanMode::Default;
     };
@@ -730,8 +731,7 @@ class VkEmulation {
 
     std::unique_ptr<CompositorVk> mCompositorVk;
 
-    // The implementation for Vulkan native swapchain. Only initialized in initVkEmulationFeatures
-    // if useVulkanNativeSwapchain is set.
+    // The implementation for Vulkan native swapchain and MacMu IOSurface display export.
     std::unique_ptr<DisplayVk> mDisplayVk;
 
     // UdmabufCreator

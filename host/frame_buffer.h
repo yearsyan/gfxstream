@@ -381,6 +381,20 @@ class FrameBuffer : public gfxstream::base::EventNotificationSupport<FrameBuffer
     int createDisplay(uint32_t displayId);
     int destroyDisplay(uint32_t displayId);
     int setDisplayColorBuffer(uint32_t displayId, uint32_t colorBuffer);
+    // MacMu IOSurface export: a display's backing ColorBuffer was (re)bound;
+    // schedule that display's frame export on the post worker.
+    void notifyDisplayColorBufferChanged(uint32_t displayId, uint32_t colorBuffer);
+    // MacMu IOSurface export: a window surface flushed into |colorBuffer|.
+    // If that ColorBuffer is bound to a secondary display (single fixed-buffer
+    // VirtualDisplays update it in place with no re-BIND), schedule the
+    // display's frame export. Cheap no-op for unbound ColorBuffers.
+    void notifyColorBufferFlushed(uint32_t colorBuffer);
+    // MacMu IOSurface export: schedule one export of |displayId|'s currently
+    // bound ColorBuffer (shell-paced streaming fallback).
+    void scheduleDisplayExport(uint32_t displayId);
+    void setDisplayExportEnabled(uint32_t displayId, bool enabled);
+    void clearDisplayExportFrame(uint32_t displayId);
+    ColorBufferPtr getDisplayColorBufferForExport(uint32_t displayId);
     int getDisplayColorBuffer(uint32_t displayId, uint32_t* colorBuffer);
     int getColorBufferDisplay(uint32_t colorBuffer, uint32_t* displayId);
     int getDisplayPose(uint32_t displayId, int32_t* x, int32_t* y, uint32_t* w,

@@ -81,6 +81,11 @@ public:
     bool destroyOpenGLSubwindow() final;
     void setOpenGLDisplayRotation(float zRot) final;
     void setOpenGLDisplayTranslation(float px, float py) final;
+    void notifyDisplayColorBufferChanged(uint32_t displayId, uint32_t colorBufferHandle) final;
+    void exportDisplayFrame(uint32_t displayId) final;
+    void setDisplayExportEnabled(uint32_t displayId, bool enabled) final;
+    void clearDisplayExportFrame(uint32_t displayId) final;
+    void resetDisplayExportSubscriptions() final;
     void repaintOpenGLDisplay() final;
 
     bool hasGuestPostedAFrame() final;

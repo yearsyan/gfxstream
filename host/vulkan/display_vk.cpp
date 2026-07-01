@@ -15,9 +15,9 @@
 #include "display_vk.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdio>
-#include <fstream>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
@@ -27,6 +27,7 @@
 #include "borrowed_image_vk.h"
 #include "gfxstream/common/logging.h"
 #include "gfxstream/host/display_operations.h"
+#include "gfxstream/host/iosurface_export.h"
 #include "gfxstream/system/System.h"
 #include "vulkan/vk_enum_string_helper.h"
 #include "vulkan/vk_format_utils.h"
@@ -39,6 +40,10 @@
 namespace gfxstream {
 namespace host {
 namespace vk {
+
+using gfxstream::host::isIosurfaceExportEnabled;
+using gfxstream::host::isIosurfaceDisplayExportEnabled;
+using gfxstream::host::FrameChannel;
 
 #define ERR_ONCE(fmt, ...)                           \
     do {                                             \
@@ -69,68 +74,138 @@ static bool shouldRecreateSwapchain(VkResult result) {
     }
 }
 
-static bool isIosurfaceExportEnabled() {
-    const std::string value = gfxstream::base::getEnvironmentVariable("MACMU_IOSURFACE_EXPORT");
-    const std::string enabled =
-        value.empty() ? gfxstream::base::getEnvironmentVariable("AEMU_IOSURFACE_EXPORT") : value;
-    return enabled == "1" || enabled == "true" || enabled == "TRUE" || enabled == "yes" ||
-           enabled == "YES";
+static uint32_t wrapperPidFromEnv() {
+    const std::string v = gfxstream::base::getEnvironmentVariable("ANDROID_EMULATOR_WRAPPER_PID");
+    if (v.empty()) return 0;
+    return static_cast<uint32_t>(std::strtoul(v.c_str(), nullptr, 10));
+}
+
+static bool traceMacMuIosurface() {
+    return gfxstream::base::getEnvironmentVariable("MACMU_IOSURFACE_TRACE") == "1";
 }
 
 #ifdef __APPLE__
 
 class IosurfaceDisplaySink {
+   private:
+    struct PresentTarget {
+        VkImage image = VK_NULL_HANDLE;
+        VkImageView imageView = VK_NULL_HANDLE;
+        VkRenderPass renderPass = VK_NULL_HANDLE;
+        VkFramebuffer framebuffer = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        IOSurfaceRef surface = nullptr;
+        IOSurfaceID surfaceId = 0;
+    };
+
    public:
     IosurfaceDisplaySink(const VulkanDispatch& vk, VkPhysicalDevice physicalDevice, VkDevice device,
                          uint32_t queueFamilyIndex, VkQueue queue,
                          std::shared_ptr<gfxstream::base::Lock> queueLock,
-                         VkCommandPool commandPool)
+                         VkCommandPool commandPool, CompositorVk* compositorVk)
         : m_vk(vk),
           m_physicalDevice(physicalDevice),
           m_device(device),
           m_queueFamilyIndex(queueFamilyIndex),
           m_queue(queue),
           m_queueLock(queueLock),
-          m_commandPool(commandPool) {
-        const std::string path =
-            gfxstream::base::getEnvironmentVariable("MACMU_IOSURFACE_EXPORT_PATH");
-        const std::string metadataPath =
-            path.empty() ? gfxstream::base::getEnvironmentVariable("AEMU_IOSURFACE_EXPORT_PATH")
-                         : path;
-        m_metadataPath = metadataPath.empty() ? "/tmp/macmu-iosurface.json" : metadataPath;
+          m_commandPool(commandPool),
+          m_compositorVk(compositorVk) {
+        const uint32_t pid = wrapperPidFromEnv();
+        if (pid != 0) {
+            m_frameChannel = FrameChannel::createProducer(pid);
+            if (m_frameChannel && m_frameChannel->valid()) {
+                GFXSTREAM_INFO("MACMU_IOSURFACE_EXPORT VK using FrameChannel producer (pid=%u).",
+                               pid);
+            }
+        }
     }
 
-    ~IosurfaceDisplaySink() { destroyTarget(); }
+    ~IosurfaceDisplaySink() { destroyTargets(); }
 
     Display::PostResult post(const DisplayVk::Post& postCmd) {
+        if (!isIosurfaceDisplayExportEnabled(/*displayId=*/0)) {
+            return {.success = true, .postCompletedWaitable = completedFuture()};
+        }
+        const bool trace = traceMacMuIosurface();
+        if (trace) {
+            GFXSTREAM_INFO("MACMU_IOSURFACE_TRACE sink post begin layers=%zu frame=%ux%u.",
+                           postCmd.layers.size(), postCmd.frameWidth, postCmd.frameHeight);
+        }
         if (postCmd.layers.empty()) {
             return {.success = true, .postCompletedWaitable = completedFuture()};
         }
-        if (postCmd.layers.size() > 1) {
-            GFXSTREAM_WARNING(
-                "MACMU_IOSURFACE_EXPORT currently exports only the first display layer.");
-        }
-        if (postCmd.layers[0].rotationDegrees != 0.0f ||
-            postCmd.layers[0].colorTransform.has_value() || postCmd.colorTransform.has_value()) {
-            GFXSTREAM_WARNING("MACMU_IOSURFACE_EXPORT prototype ignores rotation/color transform.");
+
+        std::vector<const BorrowedImageInfoVk*> sources;
+        sources.reserve(postCmd.layers.size());
+        for (const auto& layer : postCmd.layers) {
+            const auto* source = static_cast<const BorrowedImageInfoVk*>(layer.info);
+            if (!source || source->image == VK_NULL_HANDLE) {
+                GFXSTREAM_ERROR("MACMU_IOSURFACE_EXPORT source image is missing.");
+                return {.success = false, .postCompletedWaitable = completedFuture()};
+            }
+            const uint32_t sourceWidth = source->imageCreateInfo.extent.width;
+            const uint32_t sourceHeight = source->imageCreateInfo.extent.height;
+            if (sourceWidth == 0 || sourceHeight == 0) {
+                GFXSTREAM_ERROR("MACMU_IOSURFACE_EXPORT source image has invalid size %ux%u.",
+                                sourceWidth, sourceHeight);
+                return {.success = false, .postCompletedWaitable = completedFuture()};
+            }
+            sources.push_back(source);
         }
 
-        const auto* source = static_cast<const BorrowedImageInfoVk*>(postCmd.layers[0].info);
-        if (!source || source->image == VK_NULL_HANDLE) {
-            GFXSTREAM_ERROR("MACMU_IOSURFACE_EXPORT source image is missing.");
+        const uint32_t targetWidth =
+            postCmd.frameWidth ? postCmd.frameWidth : sources[0]->imageCreateInfo.extent.width;
+        const uint32_t targetHeight =
+            postCmd.frameHeight ? postCmd.frameHeight : sources[0]->imageCreateInfo.extent.height;
+        if (!ensureTargets(targetWidth, targetHeight)) {
             return {.success = false, .postCompletedWaitable = completedFuture()};
         }
+        const size_t targetIndex = m_nextTargetIndex;
+        PresentTarget& target = m_targets[targetIndex];
 
-        const uint32_t width = source->imageCreateInfo.extent.width;
-        const uint32_t height = source->imageCreateInfo.extent.height;
-        if (width == 0 || height == 0) {
-            GFXSTREAM_ERROR("MACMU_IOSURFACE_EXPORT source image has invalid size %ux%u.", width,
-                            height);
-            return {.success = false, .postCompletedWaitable = completedFuture()};
+        const bool allowDirectBlit =
+            gfxstream::base::getEnvironmentVariable("MACMU_IOSURFACE_DIRECT_BLIT") == "1";
+        const bool useDirectBlit = allowDirectBlit && canDirectBlit(postCmd, *sources[0]);
+        CompositorVkBase::ImmediateModeResources* imResources = nullptr;
+        if (useDirectBlit) {
+            if (!m_loggedDirectBlit) {
+                GFXSTREAM_INFO("MACMU_IOSURFACE_EXPORT using final-present direct GPU blit.");
+                m_loggedDirectBlit = true;
+            }
+        } else {
+            if (!m_compositorVk) {
+                GFXSTREAM_ERROR("MACMU_IOSURFACE_EXPORT requires CompositorVk for this post.");
+                return {.success = false, .postCompletedWaitable = completedFuture()};
+            }
+            for (const auto* source : sources) {
+                if (source->imageView == VK_NULL_HANDLE) {
+                    GFXSTREAM_ERROR(
+                        "MACMU_IOSURFACE_EXPORT source image view is missing for composition.");
+                    return {.success = false, .postCompletedWaitable = completedFuture()};
+                }
+            }
+            imResources = m_compositorVk->acquireImmediateModeResources();
+            if (!imResources) {
+                GFXSTREAM_ERROR("MACMU_IOSURFACE_EXPORT failed to acquire compositor resources.");
+                return {.success = false, .postCompletedWaitable = completedFuture()};
+            }
+            if (trace) {
+                GFXSTREAM_INFO("MACMU_IOSURFACE_TRACE sink acquired compositor resources.");
+            }
+            if (!m_loggedCompositorPath) {
+                GFXSTREAM_INFO(
+                    "MACMU_IOSURFACE_EXPORT using final-present compositor GPU copy.");
+                m_loggedCompositorPath = true;
+            }
         }
-        if (!ensureTarget(width, height)) {
-            return {.success = false, .postCompletedWaitable = completedFuture()};
-        }
+        auto releaseImmediateResources = [&]() {
+            if (imResources) {
+                m_compositorVk->releaseImmediateModeResources(imResources);
+                imResources = nullptr;
+            }
+        };
 
         if (m_commandBuffer == VK_NULL_HANDLE) {
             VkCommandBufferAllocateInfo commandBufferAi = {
@@ -142,6 +217,7 @@ class IosurfaceDisplaySink {
             VkResult result =
                 m_vk.vkAllocateCommandBuffers(m_device, &commandBufferAi, &m_commandBuffer);
             if (result != VK_SUCCESS) {
+                releaseImmediateResources();
                 GFXSTREAM_ERROR("MACMU_IOSURFACE_EXPORT failed to allocate command buffer: %s",
                                 string_VkResult(result));
                 return {.success = false, .postCompletedWaitable = completedFuture()};
@@ -154,6 +230,7 @@ class IosurfaceDisplaySink {
             };
             VkResult result = m_vk.vkCreateFence(m_device, &fenceCi, nullptr, &m_fence);
             if (result != VK_SUCCESS) {
+                releaseImmediateResources();
                 GFXSTREAM_ERROR("MACMU_IOSURFACE_EXPORT failed to create fence: %s",
                                 string_VkResult(result));
                 return {.success = false, .postCompletedWaitable = completedFuture()};
@@ -163,9 +240,13 @@ class IosurfaceDisplaySink {
         VkResult waitResult =
             m_vk.vkWaitForFences(m_device, 1, &m_fence, VK_TRUE, kVkWaitForFencesTimeoutNsecs);
         if (waitResult != VK_SUCCESS) {
+            releaseImmediateResources();
             GFXSTREAM_ERROR("MACMU_IOSURFACE_EXPORT timed out waiting for previous frame: %s",
                             string_VkResult(waitResult));
             return {.success = false, .postCompletedWaitable = completedFuture()};
+        }
+        if (trace) {
+            GFXSTREAM_INFO("MACMU_IOSURFACE_TRACE sink previous fence ready.");
         }
         m_vk.vkResetFences(m_device, 1, &m_fence);
         m_vk.vkResetCommandBuffer(m_commandBuffer, 0);
@@ -176,6 +257,7 @@ class IosurfaceDisplaySink {
         };
         VkResult beginResult = m_vk.vkBeginCommandBuffer(m_commandBuffer, &beginInfo);
         if (beginResult != VK_SUCCESS) {
+            releaseImmediateResources();
             GFXSTREAM_ERROR("MACMU_IOSURFACE_EXPORT failed to begin command buffer: %s",
                             string_VkResult(beginResult));
             return {.success = false, .postCompletedWaitable = completedFuture()};
@@ -185,21 +267,26 @@ class IosurfaceDisplaySink {
         std::vector<VkImageMemoryBarrier> acquireLayoutTransitionBarriers;
         std::vector<VkImageMemoryBarrier> releaseLayoutTransitionBarriers;
         std::vector<VkImageMemoryBarrier> releaseQueueTransferBarriers;
-        addNeededBarriersToUseBorrowedImage(
-            *source, m_queueFamilyIndex, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
-            &acquireQueueTransferBarriers, &acquireLayoutTransitionBarriers,
-            &releaseLayoutTransitionBarriers, &releaseQueueTransferBarriers);
+        const VkImageLayout sourceLayout = useDirectBlit ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+                                                        : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        const VkAccessFlags sourceAccess =
+            useDirectBlit ? VK_ACCESS_TRANSFER_READ_BIT : VK_ACCESS_SHADER_READ_BIT;
+        for (const auto* source : sources) {
+            addNeededBarriersToUseBorrowedImage(
+                *source, m_queueFamilyIndex, sourceLayout, sourceLayout, sourceAccess,
+                &acquireQueueTransferBarriers, &acquireLayoutTransitionBarriers,
+                &releaseLayoutTransitionBarriers, &releaseQueueTransferBarriers);
+        }
 
         if (!acquireQueueTransferBarriers.empty()) {
             m_vk.vkCmdPipelineBarrier(m_commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                      VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                                      VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr,
                                       static_cast<uint32_t>(acquireQueueTransferBarriers.size()),
                                       acquireQueueTransferBarriers.data());
         }
         if (!acquireLayoutTransitionBarriers.empty()) {
             m_vk.vkCmdPipelineBarrier(m_commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                      VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                                      VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr,
                                       static_cast<uint32_t>(acquireLayoutTransitionBarriers.size()),
                                       acquireLayoutTransitionBarriers.data());
         }
@@ -211,75 +298,139 @@ class IosurfaceDisplaySink {
             .baseArrayLayer = 0,
             .layerCount = 1,
         };
-        VkImageMemoryBarrier targetToTransfer = {
-            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .srcAccessMask = m_targetLayout == VK_IMAGE_LAYOUT_UNDEFINED ? 0 : VK_ACCESS_MEMORY_READ_BIT,
-            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-            .oldLayout = m_targetLayout,
-            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = m_targetImage,
-            .subresourceRange = colorRange,
-        };
-        m_vk.vkCmdPipelineBarrier(m_commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                  VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
-                                  &targetToTransfer);
 
-        VkImageBlit blitRegion = {
-            .srcSubresource =
-                {
-                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                    .mipLevel = 0,
-                    .baseArrayLayer = 0,
-                    .layerCount = 1,
-                },
-            .srcOffsets =
-                {
-                    {0, 0, 0},
-                    {static_cast<int32_t>(width), static_cast<int32_t>(height), 1},
-                },
-            .dstSubresource =
-                {
-                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                    .mipLevel = 0,
-                    .baseArrayLayer = 0,
-                    .layerCount = 1,
-                },
-            .dstOffsets =
-                {
-                    {0, 0, 0},
-                    {static_cast<int32_t>(m_width), static_cast<int32_t>(m_height), 1},
-                },
-        };
-        m_vk.vkCmdBlitImage(m_commandBuffer, source->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                            m_targetImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blitRegion,
-                            VK_FILTER_NEAREST);
+        if (useDirectBlit) {
+            VkImageMemoryBarrier targetToTransfer = {
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .srcAccessMask =
+                    target.layout == VK_IMAGE_LAYOUT_UNDEFINED ? 0 : VK_ACCESS_MEMORY_READ_BIT,
+                .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .oldLayout = target.layout,
+                .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = target.image,
+                .subresourceRange = colorRange,
+            };
+            m_vk.vkCmdPipelineBarrier(m_commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                      VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                                      &targetToTransfer);
+
+            const auto* source = sources[0];
+            const uint32_t sourceWidth = source->imageCreateInfo.extent.width;
+            const uint32_t sourceHeight = source->imageCreateInfo.extent.height;
+            VkImageBlit blitRegion = {
+                .srcSubresource =
+                    {
+                        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                        .mipLevel = 0,
+                        .baseArrayLayer = 0,
+                        .layerCount = 1,
+                    },
+                .srcOffsets =
+                    {
+                        {0, 0, 0},
+                        {static_cast<int32_t>(sourceWidth), static_cast<int32_t>(sourceHeight), 1},
+                    },
+                .dstSubresource =
+                    {
+                        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                        .mipLevel = 0,
+                        .baseArrayLayer = 0,
+                        .layerCount = 1,
+                    },
+                .dstOffsets =
+                    {
+                        {0, 0, 0},
+                        {static_cast<int32_t>(m_width), static_cast<int32_t>(m_height), 1},
+                    },
+            };
+            m_vk.vkCmdBlitImage(m_commandBuffer, source->image,
+                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target.image,
+                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blitRegion,
+                                VK_FILTER_NEAREST);
+        } else {
+            if (trace) {
+                GFXSTREAM_INFO("MACMU_IOSURFACE_TRACE sink draw compositor begin.");
+            }
+            const bool targetNeedsInitialClear = target.layout == VK_IMAGE_LAYOUT_UNDEFINED;
+            if (targetNeedsInitialClear) {
+                VkImageMemoryBarrier targetToTransfer = {
+                    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                    .srcAccessMask = 0,
+                    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = target.image,
+                    .subresourceRange = colorRange,
+                };
+                m_vk.vkCmdPipelineBarrier(m_commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                                          1, &targetToTransfer);
+
+                const VkClearColorValue clearColor = {{0.0f, 0.0f, 0.0f, 1.0f}};
+                m_vk.vkCmdClearColorImage(m_commandBuffer, target.image,
+                                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearColor, 1,
+                                          &colorRange);
+            }
+
+            VkImageMemoryBarrier targetToAttachment = {
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .srcAccessMask = targetNeedsInitialClear ? VK_ACCESS_TRANSFER_WRITE_BIT
+                                                         : VK_ACCESS_MEMORY_READ_BIT,
+                .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                .oldLayout = targetNeedsInitialClear ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+                                                     : target.layout,
+                .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = target.image,
+                .subresourceRange = colorRange,
+            };
+            m_vk.vkCmdPipelineBarrier(
+                m_commandBuffer,
+                targetNeedsInitialClear ? VK_PIPELINE_STAGE_TRANSFER_BIT
+                                        : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                &targetToAttachment);
+
+            drawCompositedLayers(postCmd, sources, imResources, target);
+            if (trace) {
+                GFXSTREAM_INFO("MACMU_IOSURFACE_TRACE sink draw compositor end.");
+            }
+        }
 
         VkImageMemoryBarrier targetToGeneral = {
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .srcAccessMask = useDirectBlit ? VK_ACCESS_TRANSFER_WRITE_BIT
+                                           : VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
             .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
-            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .oldLayout = useDirectBlit ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+                                       : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             .newLayout = VK_IMAGE_LAYOUT_GENERAL,
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = m_targetImage,
+            .image = target.image,
             .subresourceRange = colorRange,
         };
-        m_vk.vkCmdPipelineBarrier(m_commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        const VkPipelineStageFlags targetReleaseStage =
+            useDirectBlit ? VK_PIPELINE_STAGE_TRANSFER_BIT
+                          : VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        m_vk.vkCmdPipelineBarrier(m_commandBuffer, targetReleaseStage,
                                   VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1,
                                   &targetToGeneral);
-        m_targetLayout = VK_IMAGE_LAYOUT_GENERAL;
+        target.layout = VK_IMAGE_LAYOUT_GENERAL;
 
         if (!releaseLayoutTransitionBarriers.empty()) {
-            m_vk.vkCmdPipelineBarrier(m_commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            m_vk.vkCmdPipelineBarrier(m_commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                       VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr,
                                       static_cast<uint32_t>(releaseLayoutTransitionBarriers.size()),
                                       releaseLayoutTransitionBarriers.data());
         }
         if (!releaseQueueTransferBarriers.empty()) {
-            m_vk.vkCmdPipelineBarrier(m_commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            m_vk.vkCmdPipelineBarrier(m_commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                       VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr,
                                       static_cast<uint32_t>(releaseQueueTransferBarriers.size()),
                                       releaseQueueTransferBarriers.data());
@@ -287,6 +438,7 @@ class IosurfaceDisplaySink {
 
         VkResult endResult = m_vk.vkEndCommandBuffer(m_commandBuffer);
         if (endResult != VK_SUCCESS) {
+            releaseImmediateResources();
             GFXSTREAM_ERROR("MACMU_IOSURFACE_EXPORT failed to end command buffer: %s",
                             string_VkResult(endResult));
             return {.success = false, .postCompletedWaitable = completedFuture()};
@@ -299,33 +451,188 @@ class IosurfaceDisplaySink {
         };
         {
             gfxstream::base::AutoLock lock(*m_queueLock);
+            if (trace) {
+                GFXSTREAM_INFO("MACMU_IOSURFACE_TRACE sink queue submit begin.");
+            }
             VkResult submitResult = m_vk.vkQueueSubmit(m_queue, 1, &submitInfo, m_fence);
             if (submitResult != VK_SUCCESS) {
-                GFXSTREAM_ERROR("MACMU_IOSURFACE_EXPORT failed to submit blit: %s",
+                releaseImmediateResources();
+                GFXSTREAM_ERROR("MACMU_IOSURFACE_EXPORT failed to submit final present: %s",
                                 string_VkResult(submitResult));
                 return {.success = false, .postCompletedWaitable = completedFuture()};
+            }
+            if (trace) {
+                GFXSTREAM_INFO("MACMU_IOSURFACE_TRACE sink queue submit end.");
             }
         }
 
         VkResult frameResult =
             m_vk.vkWaitForFences(m_device, 1, &m_fence, VK_TRUE, kVkWaitForFencesTimeoutNsecs);
         if (frameResult != VK_SUCCESS) {
+            releaseImmediateResources();
             GFXSTREAM_ERROR("MACMU_IOSURFACE_EXPORT frame wait failed: %s",
                             string_VkResult(frameResult));
             return {.success = false, .postCompletedWaitable = completedFuture()};
         }
+        if (trace) {
+            GFXSTREAM_INFO("MACMU_IOSURFACE_TRACE sink frame fence ready.");
+        }
 
+        releaseImmediateResources();
         ++m_frameNumber;
-        publishMetadata();
+        publishMetadata(target);
+        m_nextTargetIndex = (targetIndex + 1) % kPresentTargetCount;
+        if (trace) {
+            GFXSTREAM_INFO("MACMU_IOSURFACE_TRACE sink post done frame=%llu.",
+                           static_cast<unsigned long long>(m_frameNumber));
+        }
         return {.success = true, .postCompletedWaitable = completedFuture()};
     }
 
    private:
-    bool ensureTarget(uint32_t width, uint32_t height) {
-        if (m_width == width && m_height == height && m_targetImage != VK_NULL_HANDLE) {
+    VkFormatFeatureFlags getFormatFeatures(VkFormat format, VkImageTiling tiling) {
+        VkFormatProperties formatProperties = {};
+        m_vk.vkGetPhysicalDeviceFormatProperties(m_physicalDevice, format, &formatProperties);
+        if (tiling == VK_IMAGE_TILING_LINEAR) {
+            return formatProperties.linearTilingFeatures;
+        }
+        if (tiling == VK_IMAGE_TILING_OPTIMAL) {
+            return formatProperties.optimalTilingFeatures;
+        }
+        GFXSTREAM_ERROR("MACMU_IOSURFACE_EXPORT unknown image tiling %#" PRIx64 ".",
+                        static_cast<uint64_t>(tiling));
+        return 0;
+    }
+
+    bool canDirectBlit(const DisplayVk::Post& postCmd, const BorrowedImageInfoVk& source) {
+        if (postCmd.layers.size() != 1) {
+            return false;
+        }
+        const auto& layer = postCmd.layers[0];
+        if (layer.rotationDegrees != 0.0f || layer.colorTransform.has_value() ||
+            postCmd.colorTransform.has_value() || hwc_rect_get_width(&layer.displayFrame) != 0) {
+            return false;
+        }
+
+        const VkImageCreateInfo& sourceCi = source.imageCreateInfo;
+        if (!(sourceCi.usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
+            return false;
+        }
+        VkFormatFeatureFlags sourceFeatures = getFormatFeatures(sourceCi.format, sourceCi.tiling);
+        if (!(sourceFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT)) {
+            return false;
+        }
+        if (formatRequiresSamplerYcbcrConversion(sourceCi.format)) {
+            return false;
+        }
+        if (formatIsSInt(sourceCi.format) || formatIsSInt(kTargetFormat)) {
+            if (!(formatIsSInt(sourceCi.format) && formatIsSInt(kTargetFormat))) {
+                return false;
+            }
+        }
+        if (formatIsUInt(sourceCi.format) || formatIsUInt(kTargetFormat)) {
+            if (!(formatIsUInt(sourceCi.format) && formatIsUInt(kTargetFormat))) {
+                return false;
+            }
+        }
+        if (formatIsDepthOrStencil(sourceCi.format) || formatIsDepthOrStencil(kTargetFormat)) {
+            if (sourceCi.format != kTargetFormat) {
+                return false;
+            }
+        }
+        if (sourceCi.samples != VK_SAMPLE_COUNT_1_BIT) {
+            return false;
+        }
+        if (sourceCi.flags & VK_IMAGE_CREATE_SUBSAMPLED_BIT_EXT) {
+            return false;
+        }
+        return true;
+    }
+
+    void drawCompositedLayers(const DisplayVk::Post& postCmd,
+                              const std::vector<const BorrowedImageInfoVk*>& sources,
+                              CompositorVkBase::ImmediateModeResources* imResources,
+                              const PresentTarget& target) {
+        CompositorVk::ImageDrawParams drawParams = {
+            .commandBuffer = m_commandBuffer,
+            .targetFormat = kTargetFormat,
+            .targetWidth = m_width,
+            .targetHeight = m_height,
+            .targetRenderPass = target.renderPass,
+            .targetFramebuffer = target.framebuffer,
+            .frameResources = imResources,
+            .rotationDegrees = 0.0f,
+            .useScreenBlend = false,
+            .colorTransform = std::nullopt,
+        };
+
+        int32_t logicalWidth = postCmd.frameWidth;
+        int32_t logicalHeight = postCmd.frameHeight;
+        if (logicalWidth == 0 || logicalHeight == 0) {
+            for (const auto& layer : postCmd.layers) {
+                logicalWidth = std::max(logicalWidth, layer.displayFrame.right);
+                logicalHeight = std::max(logicalHeight, layer.displayFrame.bottom);
+            }
+        }
+        if (logicalWidth == 0) logicalWidth = m_width;
+        if (logicalHeight == 0) logicalHeight = m_height;
+
+        const float scaleX = static_cast<float>(m_width) / logicalWidth;
+        const float scaleY = static_cast<float>(m_height) / logicalHeight;
+        const bool renderBackground = m_compositorVk->hasScreenBackground();
+        const bool isMultiDisplay = postCmd.layers.size() > 1;
+
+        for (size_t i = 0; i < postCmd.layers.size(); ++i) {
+            const auto& layer = postCmd.layers[i];
+            drawParams.colorTransform =
+                layer.colorTransform.has_value() ? layer.colorTransform : postCmd.colorTransform;
+            drawParams.rotationDegrees = layer.rotationDegrees;
+
+            if (hwc_rect_get_width(&layer.displayFrame) == 0 ||
+                hwc_rect_get_height(&layer.displayFrame) == 0) {
+                drawParams.displayFrame.left = 0;
+                drawParams.displayFrame.top = 0;
+                drawParams.displayFrame.right = m_width;
+                drawParams.displayFrame.bottom = m_height;
+            } else {
+                const int32_t flippedTop = logicalHeight - layer.displayFrame.bottom;
+                drawParams.displayFrame.left =
+                    static_cast<int32_t>(layer.displayFrame.left * scaleX);
+                drawParams.displayFrame.top = static_cast<int32_t>(flippedTop * scaleY);
+                drawParams.displayFrame.right =
+                    static_cast<int32_t>(layer.displayFrame.right * scaleX);
+                drawParams.displayFrame.bottom = static_cast<int32_t>(
+                    (flippedTop + hwc_rect_get_height(&layer.displayFrame)) * scaleY);
+            }
+
+            if (i == 0 && renderBackground && !isMultiDisplay) {
+                m_compositorVk->drawScreenBackground(drawParams);
+                drawParams.useScreenBlend = true;
+
+                Rect scaledDisplayRect = {};
+                if (m_compositorVk->getScaledDisplayRect(scaledDisplayRect, m_width, m_height)) {
+                    drawParams.displayFrame.left = scaledDisplayRect.pos.x;
+                    drawParams.displayFrame.top = scaledDisplayRect.pos.y;
+                    drawParams.displayFrame.right =
+                        drawParams.displayFrame.left + scaledDisplayRect.size.w;
+                    drawParams.displayFrame.bottom =
+                        drawParams.displayFrame.top + scaledDisplayRect.size.h;
+                }
+            }
+
+            m_compositorVk->drawImage(drawParams, sources[i]->imageView);
+
+            if (i == 0 && m_compositorVk->hasScreenMask() && !isMultiDisplay) {
+                m_compositorVk->drawScreenMask(drawParams);
+            }
+        }
+    }
+
+    bool ensureTargets(uint32_t width, uint32_t height) {
+        if (m_width == width && m_height == height && targetsReady()) {
             return true;
         }
-        destroyTarget();
+        destroyTargets();
 
         if (!m_vk.vkExportMetalObjectsEXT) {
             GFXSTREAM_ERROR("MACMU_IOSURFACE_EXPORT requires VK_EXT_metal_objects.");
@@ -339,7 +646,28 @@ class IosurfaceDisplaySink {
             GFXSTREAM_ERROR("MACMU_IOSURFACE_EXPORT target format cannot be a blit destination.");
             return false;
         }
+        if (!(formatProperties.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) {
+            GFXSTREAM_ERROR(
+                "MACMU_IOSURFACE_EXPORT target format cannot be a color attachment.");
+            return false;
+        }
 
+        m_width = width;
+        m_height = height;
+        m_nextTargetIndex = 0;
+        for (size_t i = 0; i < kPresentTargetCount; ++i) {
+            if (!createTarget(m_targets[i], width, height, i)) {
+                destroyTargets();
+                return false;
+            }
+        }
+        GFXSTREAM_INFO(
+            "MACMU_IOSURFACE_EXPORT final-present GPU-copy using %zu IOSurface buffers size=%ux%u",
+            kPresentTargetCount, m_width, m_height);
+        return true;
+    }
+
+    bool createTarget(PresentTarget& target, uint32_t width, uint32_t height, size_t index) {
         VkExportMetalObjectCreateInfoEXT exportObjectCi = {
             .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT,
             .pNext = nullptr,
@@ -356,27 +684,28 @@ class IosurfaceDisplaySink {
             .arrayLayers = 1,
             .samples = VK_SAMPLE_COUNT_1_BIT,
             .tiling = VK_IMAGE_TILING_OPTIMAL,
-            .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
             .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
             .queueFamilyIndexCount = 0,
             .pQueueFamilyIndices = nullptr,
             .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
         };
-        VkResult imageResult = m_vk.vkCreateImage(m_device, &imageCi, nullptr, &m_targetImage);
+        VkResult imageResult = m_vk.vkCreateImage(m_device, &imageCi, nullptr, &target.image);
         if (imageResult != VK_SUCCESS) {
             GFXSTREAM_ERROR("MACMU_IOSURFACE_EXPORT failed to create target image: %s",
                             string_VkResult(imageResult));
-            destroyTarget();
+            destroyTarget(target);
             return false;
         }
 
         VkMemoryRequirements memoryRequirements = {};
-        m_vk.vkGetImageMemoryRequirements(m_device, m_targetImage, &memoryRequirements);
+        m_vk.vkGetImageMemoryRequirements(m_device, target.image, &memoryRequirements);
         uint32_t memoryTypeIndex = 0;
         if (!findMemoryType(memoryRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                             &memoryTypeIndex)) {
             GFXSTREAM_ERROR("MACMU_IOSURFACE_EXPORT failed to find target memory type.");
-            destroyTarget();
+            destroyTarget(target);
             return false;
         }
 
@@ -385,26 +714,31 @@ class IosurfaceDisplaySink {
             .allocationSize = memoryRequirements.size,
             .memoryTypeIndex = memoryTypeIndex,
         };
-        VkResult memoryResult = m_vk.vkAllocateMemory(m_device, &memoryAi, nullptr, &m_targetMemory);
+        VkResult memoryResult = m_vk.vkAllocateMemory(m_device, &memoryAi, nullptr, &target.memory);
         if (memoryResult != VK_SUCCESS) {
             GFXSTREAM_ERROR("MACMU_IOSURFACE_EXPORT failed to allocate target memory: %s",
                             string_VkResult(memoryResult));
-            destroyTarget();
+            destroyTarget(target);
             return false;
         }
 
-        VkResult bindResult = m_vk.vkBindImageMemory(m_device, m_targetImage, m_targetMemory, 0);
+        VkResult bindResult = m_vk.vkBindImageMemory(m_device, target.image, target.memory, 0);
         if (bindResult != VK_SUCCESS) {
             GFXSTREAM_ERROR("MACMU_IOSURFACE_EXPORT failed to bind target image memory: %s",
                             string_VkResult(bindResult));
-            destroyTarget();
+            destroyTarget(target);
+            return false;
+        }
+
+        if (!createTargetFramebuffer(target, width, height)) {
+            destroyTarget(target);
             return false;
         }
 
         VkExportMetalIOSurfaceInfoEXT iosurfaceInfo = {
             .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_IO_SURFACE_INFO_EXT,
             .pNext = nullptr,
-            .image = m_targetImage,
+            .image = target.image,
             .ioSurface = nullptr,
         };
         VkExportMetalObjectsInfoEXT exportInfo = {
@@ -414,20 +748,108 @@ class IosurfaceDisplaySink {
         m_vk.vkExportMetalObjectsEXT(m_device, &exportInfo);
         if (!iosurfaceInfo.ioSurface) {
             GFXSTREAM_ERROR("MACMU_IOSURFACE_EXPORT failed to export IOSurface.");
-            destroyTarget();
+            destroyTarget(target);
             return false;
         }
 
-        m_surface = iosurfaceInfo.ioSurface;
-        CFRetain(m_surface);
-        m_surfaceId = IOSurfaceGetID(m_surface);
-        m_width = width;
-        m_height = height;
-        m_targetLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        GFXSTREAM_INFO("MACMU_IOSURFACE_EXPORT publishing IOSurface id=%u size=%ux%u to %s",
-                       static_cast<uint32_t>(m_surfaceId), m_width, m_height,
-                       m_metadataPath.c_str());
-        publishMetadata();
+        target.surface = iosurfaceInfo.ioSurface;
+        CFRetain(target.surface);
+        target.surfaceId = IOSurfaceGetID(target.surface);
+        target.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        GFXSTREAM_INFO(
+            "MACMU_IOSURFACE_EXPORT final-present GPU-copy IOSurface[%zu] id=%u size=%ux%u",
+            index, static_cast<uint32_t>(target.surfaceId), width, height);
+        return true;
+    }
+
+    bool createTargetFramebuffer(PresentTarget& target, uint32_t width, uint32_t height) {
+        const VkImageSubresourceRange colorRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        };
+        const VkImageViewCreateInfo imageViewCi = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .image = target.image,
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format = kTargetFormat,
+            .components = {.r = VK_COMPONENT_SWIZZLE_IDENTITY,
+                           .g = VK_COMPONENT_SWIZZLE_IDENTITY,
+                           .b = VK_COMPONENT_SWIZZLE_IDENTITY,
+                           .a = VK_COMPONENT_SWIZZLE_IDENTITY},
+            .subresourceRange = colorRange,
+        };
+        VkResult imageViewResult =
+            m_vk.vkCreateImageView(m_device, &imageViewCi, nullptr, &target.imageView);
+        if (imageViewResult != VK_SUCCESS) {
+            GFXSTREAM_ERROR("MACMU_IOSURFACE_EXPORT failed to create target image view: %s",
+                            string_VkResult(imageViewResult));
+            return false;
+        }
+
+        const VkAttachmentDescription colorAttachment = {
+            .format = kTargetFormat,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+            .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            .initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        };
+        const VkAttachmentReference colorAttachmentRef = {
+            .attachment = 0,
+            .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        };
+        const VkSubpassDescription subpass = {
+            .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+            .colorAttachmentCount = 1,
+            .pColorAttachments = &colorAttachmentRef,
+        };
+        const VkSubpassDependency subpassDependency = {
+            .srcSubpass = VK_SUBPASS_EXTERNAL,
+            .dstSubpass = 0,
+            .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .srcAccessMask = 0,
+            .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        };
+        const VkRenderPassCreateInfo renderPassCi = {
+            .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+            .attachmentCount = 1,
+            .pAttachments = &colorAttachment,
+            .subpassCount = 1,
+            .pSubpasses = &subpass,
+            .dependencyCount = 1,
+            .pDependencies = &subpassDependency,
+        };
+        VkResult renderPassResult =
+            m_vk.vkCreateRenderPass(m_device, &renderPassCi, nullptr, &target.renderPass);
+        if (renderPassResult != VK_SUCCESS) {
+            GFXSTREAM_ERROR("MACMU_IOSURFACE_EXPORT failed to create target render pass: %s",
+                            string_VkResult(renderPassResult));
+            return false;
+        }
+
+        const VkFramebufferCreateInfo framebufferCi = {
+            .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+            .renderPass = target.renderPass,
+            .attachmentCount = 1,
+            .pAttachments = &target.imageView,
+            .width = width,
+            .height = height,
+            .layers = 1,
+        };
+        VkResult framebufferResult =
+            m_vk.vkCreateFramebuffer(m_device, &framebufferCi, nullptr, &target.framebuffer);
+        if (framebufferResult != VK_SUCCESS) {
+            GFXSTREAM_ERROR("MACMU_IOSURFACE_EXPORT failed to create target framebuffer: %s",
+                            string_VkResult(framebufferResult));
+            return false;
+        }
+
         return true;
     }
 
@@ -446,46 +868,44 @@ class IosurfaceDisplaySink {
         return false;
     }
 
-    void publishMetadata() {
-        if (!m_surface) {
-            return;
+    bool targetsReady() const {
+        for (const auto& target : m_targets) {
+            if (target.image == VK_NULL_HANDLE || target.surface == nullptr ||
+                target.surfaceId == 0) {
+                return false;
+            }
         }
-        const auto now = std::chrono::steady_clock::now().time_since_epoch();
-        const auto nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
-        const std::string tmpPath = m_metadataPath + ".tmp";
-        std::ofstream out(tmpPath, std::ios::out | std::ios::trunc);
-        if (!out) {
-            GFXSTREAM_WARNING("MACMU_IOSURFACE_EXPORT could not write metadata file %s",
-                              m_metadataPath.c_str());
-            return;
-        }
-        out << "{\n"
-            << "  \"iosurface_id\": " << static_cast<uint32_t>(m_surfaceId) << ",\n"
-            << "  \"width\": " << m_width << ",\n"
-            << "  \"height\": " << m_height << ",\n"
-            << "  \"pixel_format\": \"BGRA8Unorm\",\n"
-            << "  \"frame\": " << m_frameNumber << ",\n"
-            << "  \"timestamp_ns\": " << nowNs << "\n"
-            << "}\n";
-        out.close();
-        std::rename(tmpPath.c_str(), m_metadataPath.c_str());
+        return true;
     }
 
-    void destroyTarget() {
+    void publishMetadata(const PresentTarget& target) {
+        if (!target.surface) {
+            return;
+        }
+        // Only the shared-memory + socket doorbell channel is supported. If it is
+        // unavailable there is no fallback, so drop the frame and log once so a
+        // black screen stays diagnosable.
+        if (m_frameChannel && m_frameChannel->valid()) {
+            // DisplayVk only presents the primary display: slot 0. Secondary
+            // displays are exported by the GL compose path; Vulkan composition
+            // does not export them yet.
+            m_frameChannel->publish(/*displayId=*/0, static_cast<uint32_t>(target.surfaceId),
+                                    m_width, m_height, /*flags=*/0, m_frameNumber);
+            return;
+        }
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            GFXSTREAM_ERROR("MACMU_IOSURFACE_EXPORT VK frame channel unavailable; dropping frames.");
+        }
+    }
+
+    void destroyTargets() {
         if (m_fence != VK_NULL_HANDLE) {
             m_vk.vkWaitForFences(m_device, 1, &m_fence, VK_TRUE, kVkWaitForFencesTimeoutNsecs);
         }
-        if (m_surface) {
-            CFRelease(m_surface);
-            m_surface = nullptr;
-        }
-        if (m_targetImage != VK_NULL_HANDLE) {
-            m_vk.vkDestroyImage(m_device, m_targetImage, nullptr);
-            m_targetImage = VK_NULL_HANDLE;
-        }
-        if (m_targetMemory != VK_NULL_HANDLE) {
-            m_vk.vkFreeMemory(m_device, m_targetMemory, nullptr);
-            m_targetMemory = VK_NULL_HANDLE;
+        for (auto& target : m_targets) {
+            destroyTarget(target);
         }
         if (m_commandBuffer != VK_NULL_HANDLE) {
             m_vk.vkFreeCommandBuffers(m_device, m_commandPool, 1, &m_commandBuffer);
@@ -497,11 +917,40 @@ class IosurfaceDisplaySink {
         }
         m_width = 0;
         m_height = 0;
-        m_surfaceId = 0;
-        m_targetLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        m_nextTargetIndex = 0;
+    }
+
+    void destroyTarget(PresentTarget& target) {
+        if (target.surface) {
+            CFRelease(target.surface);
+            target.surface = nullptr;
+        }
+        if (target.framebuffer != VK_NULL_HANDLE) {
+            m_vk.vkDestroyFramebuffer(m_device, target.framebuffer, nullptr);
+            target.framebuffer = VK_NULL_HANDLE;
+        }
+        if (target.renderPass != VK_NULL_HANDLE) {
+            m_vk.vkDestroyRenderPass(m_device, target.renderPass, nullptr);
+            target.renderPass = VK_NULL_HANDLE;
+        }
+        if (target.imageView != VK_NULL_HANDLE) {
+            m_vk.vkDestroyImageView(m_device, target.imageView, nullptr);
+            target.imageView = VK_NULL_HANDLE;
+        }
+        if (target.image != VK_NULL_HANDLE) {
+            m_vk.vkDestroyImage(m_device, target.image, nullptr);
+            target.image = VK_NULL_HANDLE;
+        }
+        if (target.memory != VK_NULL_HANDLE) {
+            m_vk.vkFreeMemory(m_device, target.memory, nullptr);
+            target.memory = VK_NULL_HANDLE;
+        }
+        target.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        target.surfaceId = 0;
     }
 
     static constexpr VkFormat kTargetFormat = VK_FORMAT_B8G8R8A8_UNORM;
+    static constexpr size_t kPresentTargetCount = 3;
 
     const VulkanDispatch& m_vk;
     VkPhysicalDevice m_physicalDevice;
@@ -510,18 +959,19 @@ class IosurfaceDisplaySink {
     VkQueue m_queue;
     std::shared_ptr<gfxstream::base::Lock> m_queueLock;
     VkCommandPool m_commandPool;
-    std::string m_metadataPath;
+    CompositorVk* m_compositorVk;
 
     VkCommandBuffer m_commandBuffer = VK_NULL_HANDLE;
     VkFence m_fence = VK_NULL_HANDLE;
-    VkImage m_targetImage = VK_NULL_HANDLE;
-    VkDeviceMemory m_targetMemory = VK_NULL_HANDLE;
-    VkImageLayout m_targetLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    IOSurfaceRef m_surface = nullptr;
-    IOSurfaceID m_surfaceId = 0;
+    std::array<PresentTarget, kPresentTargetCount> m_targets;
+    size_t m_nextTargetIndex = 0;
     uint32_t m_width = 0;
     uint32_t m_height = 0;
     uint64_t m_frameNumber = 0;
+    bool m_loggedDirectBlit = false;
+    bool m_loggedCompositorPath = false;
+
+    std::unique_ptr<FrameChannel> m_frameChannel;
 };
 
 #else
@@ -712,7 +1162,7 @@ DisplayVk::PostResult DisplayVk::postToIosurface(const Post& postCmd) {
     if (!m_iosurfaceDisplaySink) {
         m_iosurfaceDisplaySink = std::make_unique<IosurfaceDisplaySink>(
             m_vk, m_vkPhysicalDevice, m_vkDevice, m_compositorQueueFamilyIndex, m_compositorVkQueue,
-            m_compositorVkQueueLock, m_vkCommandPool);
+            m_compositorVkQueueLock, m_vkCommandPool, m_compositorVk);
     }
     return m_iosurfaceDisplaySink->post(postCmd);
 #else

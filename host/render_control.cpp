@@ -880,6 +880,9 @@ static int rcFlushWindowColorBuffer(uint32_t windowSurface)
     // Make the GL updates visible to other backings if necessary.
     if (colorBufferHandle != 0) {
         fb->flushColorBufferFromGl(colorBufferHandle);
+        // MacMu: single fixed-buffer VirtualDisplays update their bound
+        // ColorBuffer in place; this flush is their per-frame signal.
+        fb->notifyColorBufferFlushed(colorBufferHandle);
     }
 
     GRSYNC_DPRINT("unlock gralloc cb lock }");

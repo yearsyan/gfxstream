@@ -19,7 +19,9 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <cstdlib>
 #include <cmath>
+#include <string>
 #include <glm/gtc/type_ptr.hpp>
 
 #include "OpenGLESDispatch/DispatchTables.h"
@@ -342,6 +344,7 @@ std::unique_ptr<ColorBufferGl> ColorBufferGl::create(
     s_gles2.glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 
     s_gles2.glGenTextures(1, &cb->m_tex);
+    s_gles2.glBindTexture(GL_TEXTURE_2D, cb->m_tex);
     s_gles2.glBindTexture(GL_TEXTURE_2D, cb->m_tex);
     s_gles2.glTexImage2D(GL_TEXTURE_2D,
                          /*level=*/0,

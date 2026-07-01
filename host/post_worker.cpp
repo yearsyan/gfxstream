@@ -35,7 +35,9 @@ PostWorker::PostWorker(bool mainThreadPostingOnly, FrameBuffer* fb, Compositor* 
       m_compositor(compositor),
       m_mainThreadPostingOnly(mainThreadPostingOnly) {}
 
-std::shared_future<void> PostWorker::composeImpl(const FlatComposeRequest& composeRequest) {
+std::shared_future<void> PostWorker::composeImpl(
+    const FlatComposeRequest& composeRequest,
+    const Post::ColorBufferRefMap& colorBufferRefs) {
     std::shared_future<void> completedFuture =
         std::async(std::launch::deferred, [] {}).share();
     completedFuture.wait();
@@ -44,9 +46,24 @@ std::shared_future<void> PostWorker::composeImpl(const FlatComposeRequest& compo
         GFXSTREAM_ERROR("The last composition on the target buffer hasn't completed.");
     }
 
+    auto borrowForComposition = [&](HandleType colorBufferHandle, bool colorBufferIsTarget)
+        -> std::unique_ptr<BorrowedImageInfo> {
+        const auto it = colorBufferRefs.find(colorBufferHandle);
+        if (it != colorBufferRefs.end() && it->second) {
+            const auto api = getColorBufferUsedApi();
+            if (api == ColorBuffer::UsedApi::kVk) {
+                it->second->invalidateForVk();
+            } else {
+                it->second->invalidateForGl();
+            }
+            return it->second->borrowForComposition(api, colorBufferIsTarget);
+        }
+        return mFb->borrowColorBufferForComposition(colorBufferHandle, colorBufferIsTarget);
+    };
+
     Compositor::CompositionRequest compositorRequest = {};
-    compositorRequest.target = mFb->borrowColorBufferForComposition(composeRequest.targetHandle,
-                                                                    /*colorBufferIsTarget=*/true);
+    compositorRequest.target =
+        borrowForComposition(composeRequest.targetHandle, /*colorBufferIsTarget=*/true);
     if (!compositorRequest.target) {
         GFXSTREAM_ERROR("Compose target is null (cb=0x%x).", composeRequest.targetHandle);
         return completedFuture;
@@ -58,8 +75,7 @@ std::shared_future<void> PostWorker::composeImpl(const FlatComposeRequest& compo
             auto& compositorLayer = compositorRequest.layers.emplace_back();
             compositorLayer.props = guestLayer;
         } else {
-            auto source = mFb->borrowColorBufferForComposition(guestLayer.cbHandle,
-                                                            /*colorBufferIsTarget=*/false);
+            auto source = borrowForComposition(guestLayer.cbHandle, /*colorBufferIsTarget=*/false);
             if (!source) {
                 continue;
             }
@@ -92,12 +108,13 @@ void PostWorker::block(std::promise<void> scheduledSignal, std::future<void> con
 
 PostWorker::~PostWorker() {}
 
-void PostWorker::post(ColorBuffer* cb, std::unique_ptr<Post::CompletionCallback> postCallback,
+void PostWorker::post(std::shared_ptr<ColorBuffer> cb, HandleType cbHandle,
+              std::unique_ptr<Post::CompletionCallback> postCallback,
               const std::optional<std::array<float, 16>>& colorTransform) {
     auto packagedPostCallback = std::shared_ptr<Post::CompletionCallback>(std::move(postCallback));
     runTask(
-        std::packaged_task<void()>([cb, packagedPostCallback, this, colorTransform] {
-            auto completedFuture = postImpl(cb, colorTransform);
+        std::packaged_task<void()>([cb, cbHandle, packagedPostCallback, this, colorTransform] {
+            auto completedFuture = postImpl(cb, cbHandle, colorTransform);
             (*packagedPostCallback)(completedFuture);
         }));
 }
@@ -106,21 +123,29 @@ void PostWorker::exit() {
     runTask(std::packaged_task<void()>([this] { exitImpl(); }));
 }
 
+void PostWorker::exportDisplay(uint32_t displayId) {
+    runTask(std::packaged_task<void()>([this, displayId] { exportDisplayImpl(displayId); }));
+}
+
 void PostWorker::viewport(int width, int height) {
     runTask(std::packaged_task<void()>(
         [width, height, this] { viewportImpl(width, height); }));
 }
 
 void PostWorker::compose(std::unique_ptr<FlatComposeRequest> composeRequest,
+                         Post::ColorBufferRefMap colorBufferRefs,
                          std::unique_ptr<Post::CompletionCallback> composeCallback) {
     // std::shared_ptr(std::move(...)) is WA for MSFT STL implementation bug:
     // https://developercommunity.visualstudio.com/t/unable-to-move-stdpackaged-task-into-any-stl-conta/108672
     auto packagedComposeCallback =
         std::shared_ptr<Post::CompletionCallback>(std::move(composeCallback));
     auto packagedComposeRequest = std::shared_ptr<FlatComposeRequest>(std::move(composeRequest));
+    auto packagedColorBufferRefs =
+        std::make_shared<Post::ColorBufferRefMap>(std::move(colorBufferRefs));
     runTask(
-        std::packaged_task<void()>([packagedComposeCallback, packagedComposeRequest, this] {
-        auto completedFuture = composeImpl(*packagedComposeRequest);
+        std::packaged_task<void()>(
+            [packagedComposeCallback, packagedComposeRequest, packagedColorBufferRefs, this] {
+        auto completedFuture = composeImpl(*packagedComposeRequest, *packagedColorBufferRefs);
         m_composeTargetToComposeFuture.emplace(packagedComposeRequest->targetHandle,
                                                completedFuture);
         (*packagedComposeCallback)(completedFuture);

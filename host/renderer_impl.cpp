@@ -23,6 +23,7 @@
 #include "frame_buffer.h"
 #include "gfxstream/common/logging.h"
 #include "gfxstream/host/graphics_driver_lock.h"
+#include "gfxstream/host/iosurface_export.h"
 #include "gfxstream/host/renderer_operations.h"
 #include "gfxstream/host/tracing.h"
 #include "gfxstream/system/System.h"
@@ -532,6 +533,49 @@ void RendererImpl::setOpenGLDisplayRotation(float zRot) {
 void RendererImpl::setOpenGLDisplayTranslation(float px, float py) {
     assert(mRenderWindow);
     mRenderWindow->setTranslation(px, py);
+}
+
+void RendererImpl::notifyDisplayColorBufferChanged(uint32_t displayId,
+                                                   uint32_t colorBufferHandle) {
+    if (FrameBuffer* fb = FrameBuffer::getFB()) {
+        fb->notifyDisplayColorBufferChanged(displayId, colorBufferHandle);
+    }
+}
+
+void RendererImpl::exportDisplayFrame(uint32_t displayId) {
+    if (FrameBuffer* fb = FrameBuffer::getFB()) {
+        fb->scheduleDisplayExport(displayId);
+    }
+}
+
+void RendererImpl::setDisplayExportEnabled(uint32_t displayId, bool enabled) {
+    if (FrameBuffer* fb = FrameBuffer::getFB()) {
+        fb->setDisplayExportEnabled(displayId, enabled);
+    } else {
+        gfxstream::host::setIosurfaceDisplayExportEnabled(displayId, enabled);
+    }
+}
+
+void RendererImpl::clearDisplayExportFrame(uint32_t displayId) {
+    if (FrameBuffer* fb = FrameBuffer::getFB()) {
+        fb->clearDisplayExportFrame(displayId);
+    } else {
+        gfxstream::host::setIosurfaceDisplayExportEnabled(displayId, false);
+        if (gfxstream::host::FrameChannel* channel =
+                gfxstream::host::FrameChannel::sharedProducer()) {
+            channel->clear(displayId);
+        }
+    }
+}
+
+void RendererImpl::resetDisplayExportSubscriptions() {
+    if (FrameBuffer* fb = FrameBuffer::getFB()) {
+        for (uint32_t displayId = 0; displayId < gfxstream::host::kFrameSlotCount; ++displayId) {
+            fb->setDisplayExportEnabled(displayId, false);
+        }
+    } else {
+        gfxstream::host::resetIosurfaceDisplayExportSubscriptions();
+    }
 }
 
 void RendererImpl::repaintOpenGLDisplay() {

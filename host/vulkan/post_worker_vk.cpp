@@ -15,17 +15,25 @@
  */
 #include "post_worker_vk.h"
 
+#include <atomic>
+
+#include "borrowed_image_vk.h"
 #include "host/frame_buffer.h"
 #include "gfxstream/host/display_operations.h"
 #include "gfxstream/host/renderer_operations.h"
 #include "gfxstream/host/window_operations.h"
 #include "gfxstream/common/logging.h"
+#include "gfxstream/system/System.h"
 #include "vulkan/display_vk.h"
 
 namespace gfxstream {
 namespace host {
 namespace vk {
 namespace {
+
+bool traceMacMuIosurface() {
+    return gfxstream::base::getEnvironmentVariable("MACMU_IOSURFACE_TRACE") == "1";
+}
 
 hwc_transform_t getTransformFromRotation(int rotation) {
     switch (static_cast<int>(rotation / 90)) {
@@ -45,10 +53,14 @@ hwc_transform_t getTransformFromRotation(int rotation) {
 PostWorkerVk::PostWorkerVk(FrameBuffer* fb, Compositor* compositor, vk::DisplayVk* displayVk)
     : PostWorker(false, fb, compositor), m_displayVk(displayVk) {}
 
-std::shared_future<void> PostWorkerVk::postImpl(ColorBuffer* cb,
+std::shared_future<void> PostWorkerVk::postImpl(std::shared_ptr<ColorBuffer> cb,
+                                                HandleType cbHandle,
               const std::optional<std::array<float, 16>>& colorTransform) {
     std::shared_future<void> completedFuture = std::async(std::launch::deferred, [] {}).share();
     completedFuture.wait();
+    static std::atomic<uint64_t> sPostSeq = 0;
+    const uint64_t postSeq = ++sPostSeq;
+    const bool trace = traceMacMuIosurface();
 
     if (!m_displayVk) {
         GFXSTREAM_FATAL("PostWorker missing DisplayVk.");
@@ -57,11 +69,35 @@ std::shared_future<void> PostWorkerVk::postImpl(ColorBuffer* cb,
     std::vector<std::unique_ptr<BorrowedImageInfo>> borrowedImages;
     DisplayVk::Post postCmd;
 
-    auto addPostImage = [&](ColorBuffer* colorBuffer, int32_t x, int32_t y, int32_t w, int32_t h,
+    auto addPostImage = [&](std::shared_ptr<ColorBuffer> colorBuffer, HandleType colorBufferHandle,
+                            int32_t x, int32_t y, int32_t w, int32_t h,
                             float rotation,
                             const std::optional<std::array<float, 16>>& transform = std::nullopt) {
-        auto info = mFb->borrowColorBufferForDisplay(colorBuffer->getHndl());
-        if (!info) return;
+        if (trace) {
+            GFXSTREAM_INFO("MACMU_IOSURFACE_TRACE post=%llu borrow begin cb=%u frame=%dx%d.",
+                           static_cast<unsigned long long>(postSeq), colorBufferHandle, w, h);
+        }
+        std::unique_ptr<BorrowedImageInfo> info;
+        if (colorBuffer) {
+            colorBuffer->invalidateForVk();
+            info = colorBuffer->borrowForDisplay(ColorBuffer::UsedApi::kVk);
+        } else {
+            info = mFb->borrowColorBufferForDisplay(colorBufferHandle);
+        }
+        if (!info) {
+            if (trace) {
+                GFXSTREAM_INFO("MACMU_IOSURFACE_TRACE post=%llu borrow failed cb=%u.",
+                               static_cast<unsigned long long>(postSeq), colorBufferHandle);
+            }
+            return;
+        }
+        if (trace) {
+            const auto* vkInfo = static_cast<const BorrowedImageInfoVk*>(info.get());
+            GFXSTREAM_INFO("MACMU_IOSURFACE_TRACE post=%llu borrow done cb=%u image=%p view=%p.",
+                           static_cast<unsigned long long>(postSeq), colorBufferHandle,
+                           reinterpret_cast<void*>(vkInfo->image),
+                           reinterpret_cast<void*>(vkInfo->imageView));
+        }
 
         DisplayVk::PostLayer layer;
         layer.info = info.get();
@@ -102,7 +138,7 @@ std::shared_future<void> PostWorkerVk::postImpl(ColorBuffer* cb,
             const int32_t w = static_cast<int32_t>(windowWidth * dpr);
             const int32_t h = static_cast<int32_t>(windowHeight * dpr);
 
-            addPostImage(cb, x, y, w, h, zRot, colorTransform);
+            addPostImage(cb, cbHandle, x, y, w, h, zRot, colorTransform);
         }
 #endif
     } else if (multiDisplay.is_multi_display_enabled()) {
@@ -127,7 +163,8 @@ std::shared_future<void> PostWorkerVk::postImpl(ColorBuffer* cb,
                     currentDisplayId, currentDisplayColorBufferHandle);
             }
             // Main window post
-             addPostImage(cb, 0, 0, 0, 0, static_cast<float>(mFb->getZrot()), colorTransform);
+             addPostImage(cb, cbHandle, 0, 0, 0, 0, static_cast<float>(mFb->getZrot()),
+                          colorTransform);
         } else {
             uint32_t combinedDisplayW = 0;
             uint32_t combinedDisplayH = 0;
@@ -154,10 +191,10 @@ std::shared_future<void> PostWorkerVk::postImpl(ColorBuffer* cb,
                     continue;
                 }
 
-                ColorBuffer* currentCb =
-                    currentDisplayId == 0
-                        ? cb
-                        : mFb->findColorBuffer(currentDisplayColorBufferHandle).get();
+                const HandleType currentColorBufferHandle =
+                    currentDisplayId == 0 ? cbHandle : currentDisplayColorBufferHandle;
+                std::shared_ptr<ColorBuffer> currentCb =
+                    currentDisplayId == 0 ? cb : mFb->findColorBuffer(currentColorBufferHandle);
                 if (!currentCb) {
                     continue;
                 }
@@ -167,22 +204,35 @@ std::shared_future<void> PostWorkerVk::postImpl(ColorBuffer* cb,
                 if (transform == HWC_TRANSFORM_ROT_90 || transform == HWC_TRANSFORM_ROT_270) {
                     std::swap(currentDisplayW, currentDisplayH);
                 }
-                addPostImage(currentCb, currentDisplayOffsetX, currentDisplayOffsetY,
-                             currentDisplayW, currentDisplayH, rotation, colorTransform);
+                addPostImage(currentCb, currentColorBufferHandle, currentDisplayOffsetX,
+                             currentDisplayOffsetY, currentDisplayW, currentDisplayH, rotation,
+                             colorTransform);
             }
         }
     } else if (get_gfxstream_window_operations().is_folded()) {
         // TODO: Implement fold logic if needed (similar to GL)
         // For now simple post
-        addPostImage(cb, 0, 0, 0, 0, static_cast<float>(mFb->getZrot()), colorTransform);
+        addPostImage(cb, cbHandle, 0, 0, 0, 0, static_cast<float>(mFb->getZrot()),
+                     colorTransform);
     } else {
         // Simple case: single display, no special mode
-        addPostImage(cb, 0, 0, 0, 0, static_cast<float>(mFb->getZrot()), colorTransform);
+        addPostImage(cb, cbHandle, 0, 0, 0, 0, static_cast<float>(mFb->getZrot()),
+                     colorTransform);
     }
 
     constexpr const int kMaxPostRetries = 2;
     for (int i = 0; i < kMaxPostRetries; i++) {
+        if (trace) {
+            GFXSTREAM_INFO("MACMU_IOSURFACE_TRACE post=%llu display post begin try=%d layers=%zu.",
+                           static_cast<unsigned long long>(postSeq), i,
+                           postCmd.layers.size());
+        }
         auto result = m_displayVk->post(postCmd);
+        if (trace) {
+            GFXSTREAM_INFO("MACMU_IOSURFACE_TRACE post=%llu display post end try=%d success=%d.",
+                           static_cast<unsigned long long>(postSeq), i,
+                           result.success ? 1 : 0);
+        }
         if (result.success) {
             return result.postCompletedWaitable;
         }

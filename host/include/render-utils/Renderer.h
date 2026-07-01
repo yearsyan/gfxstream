@@ -224,6 +224,33 @@ class Renderer {
     //    interpolate between these states.
     virtual void setOpenGLDisplayTranslation(float px, float py) = 0;
 
+    // notifyDisplayColorBufferChanged -
+    //    A guest display's backing ColorBuffer was (re)bound - for
+    //    VirtualDisplay-backed secondary displays this fires once per guest
+    //    frame (the guest rotates buffers and re-binds). Used by the MacMu
+    //    IOSurface export to publish that display's frame without depending
+    //    on any other display's post cadence. Default: ignored.
+    virtual void notifyDisplayColorBufferChanged(uint32_t displayId, uint32_t colorBufferHandle) {
+        (void)displayId;
+        (void)colorBufferHandle;
+    }
+
+    // exportDisplayFrame -
+    //    Schedule one MacMu IOSurface export of |displayId|'s bound
+    //    ColorBuffer (shell-paced streaming fallback). Default: ignored.
+    virtual void exportDisplayFrame(uint32_t displayId) { (void)displayId; }
+
+    // Opt a display into/out of MacMu IOSurface export. The shell drives this
+    // from window visibility so hidden displays consume no export work.
+    virtual void setDisplayExportEnabled(uint32_t displayId, bool enabled) {
+        (void)displayId;
+        (void)enabled;
+    }
+    // Invalidate a removed display's exported frame and advance its lifecycle
+    // generation before the id can be reused.
+    virtual void clearDisplayExportFrame(uint32_t displayId) { (void)displayId; }
+    virtual void resetDisplayExportSubscriptions() {}
+
     // repaintOpenGLDisplay -
     //    causes the OpenGL subwindow to get repainted with the
     //    latest framebuffer content.

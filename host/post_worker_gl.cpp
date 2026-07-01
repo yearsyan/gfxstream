@@ -18,6 +18,7 @@
 #include "frame_buffer.h"
 #include "gfxstream/host/display_operations.h"
 #include "gfxstream/common/logging.h"
+#include "gfxstream/host/iosurface_export.h"
 #include "gfxstream/host/renderer_operations.h"
 #include "gfxstream/host/window_operations.h"
 #include "host/gl/display_gl.h"
@@ -54,7 +55,10 @@ PostWorkerGl::PostWorkerGl(bool mainThreadPostingOnly, FrameBuffer* fb, Composit
 }
 
 std::shared_future<void> PostWorkerGl::postImpl(
-    ColorBuffer* cb, const std::optional<std::array<float, 16>>& colorTransform) {
+    std::shared_ptr<ColorBuffer> cb, HandleType cbHandle,
+    const std::optional<std::array<float, 16>>& colorTransform) {
+    (void)cbHandle;
+    ColorBuffer* colorBuffer = cb.get();
     if (!mContextBound || m_mainThreadPostingOnly) {
         // This might happen on headless mode
         // Also if posting on main thread, the context binding can get polluted easily, which
@@ -77,7 +81,7 @@ std::shared_future<void> PostWorkerGl::postImpl(
         if (get_gfxstream_should_skip_draw()) {
             post.layers.clear();
         } else {
-            post.layers.push_back(postWithOverlay(cb, colorTransform));
+            post.layers.push_back(postWithOverlay(colorBuffer, colorTransform));
         }
 #endif
     } else if (multiDisplay.is_multi_display_enabled()) {
@@ -101,7 +105,7 @@ std::shared_future<void> PostWorkerGl::postImpl(
                 get_gfxstream_window_operations().paint_multi_display_window(
                     currentDisplayId, currentDisplayColorBufferHandle);
             }
-            post.layers.push_back(postWithOverlay(cb, colorTransform));
+            post.layers.push_back(postWithOverlay(colorBuffer, colorTransform));
         } else {
             uint32_t combinedDisplayW = 0;
             uint32_t combinedDisplayH = 0;
@@ -132,7 +136,7 @@ std::shared_future<void> PostWorkerGl::postImpl(
 
                 ColorBuffer* currentCb =
                     currentDisplayId == 0
-                        ? cb
+                        ? colorBuffer
                         : mFb->findColorBuffer(currentDisplayColorBufferHandle).get();
                 if (!currentCb) {
                     continue;
@@ -191,14 +195,14 @@ std::shared_future<void> PostWorkerGl::postImpl(
         postLayerOptions.transform = getTransformFromRotation(mFb->getZrot());
 
         post.layers.push_back(DisplayGl::PostLayer{
-            .colorBuffer = cb,
+            .colorBuffer = colorBuffer,
             .layerOptions = postLayerOptions,
         });
     } else {
         post.frameWidth = m_viewportWidth;
         post.frameHeight = m_viewportHeight;
 
-        post.layers.push_back(postWithOverlay(cb, colorTransform));
+        post.layers.push_back(postWithOverlay(colorBuffer, colorTransform));
     }
     return m_displayGl->post(post);
 }
@@ -278,12 +282,108 @@ void PostWorkerGl::clearImpl() {
     m_displayGl->clear();
 }
 
-std::shared_future<void> PostWorkerGl::composeImpl(const FlatComposeRequest& composeRequest) {
+std::shared_future<void> PostWorkerGl::composeImpl(
+    const FlatComposeRequest& composeRequest,
+    const Post::ColorBufferRefMap& colorBufferRefs) {
     if (!mContextBound || m_mainThreadPostingOnly) {
         // This might happen on headless mode
         setupContext();
     }
-    return PostWorker::composeImpl(composeRequest);
+    auto composeFuture = PostWorker::composeImpl(composeRequest, colorBufferRefs);
+    exportComposedDisplay(composeRequest, colorBufferRefs);
+    return composeFuture;
+}
+
+// MacMu per-display IOSurface export for VirtualDisplay-backed secondary
+// displays (phone images): the guest MultiDisplayService creates a
+// VirtualDisplay whose composition happens inside the guest, and re-BINDs the
+// rotating backing ColorBuffer to the display on every guest frame
+// (MultiDisplayPipe BIND -> MultiDisplay::setDisplayColorBuffer ->
+// Renderer::notifyDisplayColorBufferChanged -> PostCmd::MacMuExportDisplay).
+// No per-display host compose ever fires for these, and no display's cadence
+// depends on any other display: each BIND schedules exactly one export of
+// that display's currently bound ColorBuffer.
+void PostWorkerGl::exportDisplayImpl(uint32_t displayId) {
+#ifdef __APPLE__
+    if (displayId == 0 || !isIosurfaceDisplayExportEnabled(displayId)) {
+        return;
+    }
+    FrameChannel* channel = FrameChannel::sharedProducer();
+    uint64_t generation = 0;
+    // Capture the lifecycle before selecting the bound ColorBuffer. Otherwise
+    // removal/reuse could occur between retaining application A's buffer and
+    // the sink capturing application B's generation.
+    if (!channel || !channel->captureGeneration(displayId, &generation)) {
+        return;
+    }
+    if (!mContextBound || m_mainThreadPostingOnly) {
+        setupContext();
+    }
+    ColorBufferPtr displayColorBuffer = mFb->getDisplayColorBufferForExport(displayId);
+    if (!displayColorBuffer) {
+        return;
+    }
+    auto& sink = mIosurfaceComposeSinks[displayId];
+    if (!sink) {
+        sink = std::make_unique<IosurfaceGlExportSink>(displayId);
+    }
+    sink->exportColorBuffer(displayColorBuffer.get(), displayColorBuffer->getWidth(),
+                            displayColorBuffer->getHeight(), generation);
+#else
+    (void)displayId;
+#endif
+}
+
+// MacMu per-display IOSurface export for hwc-composed secondary displays
+// (e.g. automotive images): the guest composition request carries the display
+// id and lands here. The GL compositor issued its commands on this thread
+// with the post-worker context bound, so the export blit issued right after
+// is ordered behind the composition.
+void PostWorkerGl::exportComposedDisplay(const FlatComposeRequest& composeRequest,
+                                         const Post::ColorBufferRefMap& colorBufferRefs) {
+#ifdef __APPLE__
+    if (composeRequest.displayId == 0 ||
+        !isIosurfaceDisplayExportEnabled(composeRequest.displayId)) {
+        return;
+    }
+    if (composeRequest.displayId >= kFrameSlotCount) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            GFXSTREAM_ERROR("MACMU_IOSURFACE_EXPORT display id %u exceeds slot table; ignored.",
+                            composeRequest.displayId);
+        }
+        return;
+    }
+    FrameChannel* channel = FrameChannel::sharedProducer();
+    uint64_t generation = 0;
+    if (!channel || !channel->captureGeneration(composeRequest.displayId, &generation)) {
+        return;
+    }
+
+    ColorBuffer* targetColorBuffer = nullptr;
+    ColorBufferPtr targetRef;
+    const auto it = colorBufferRefs.find(composeRequest.targetHandle);
+    if (it != colorBufferRefs.end() && it->second) {
+        targetColorBuffer = it->second.get();
+    } else {
+        targetRef = mFb->findColorBuffer(composeRequest.targetHandle);
+        targetColorBuffer = targetRef.get();
+    }
+    if (!targetColorBuffer) {
+        return;
+    }
+
+    auto& sink = mIosurfaceComposeSinks[composeRequest.displayId];
+    if (!sink) {
+        sink = std::make_unique<IosurfaceGlExportSink>(composeRequest.displayId);
+    }
+    sink->exportColorBuffer(targetColorBuffer, targetColorBuffer->getWidth(),
+                            targetColorBuffer->getHeight(), generation);
+#else
+    (void)composeRequest;
+    (void)colorBufferRefs;
+#endif
 }
 
 void PostWorkerGl::setupContext() {

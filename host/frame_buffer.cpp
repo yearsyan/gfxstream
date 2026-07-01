@@ -20,6 +20,8 @@
 #include <string.h>
 #include <time.h>
 
+#include <array>
+#include <deque>
 #include <iomanip>
 
 #if defined(__linux__)
@@ -50,6 +52,7 @@
 #include "gfxstream/host/tracing.h"
 #include "gfxstream/host/display_operations.h"
 #include "gfxstream/host/guest_operations.h"
+#include "gfxstream/host/iosurface_export.h"
 #include "gfxstream/host/renderer_operations.h"
 #include "gfxstream/host/stream_utils.h"
 #include "gfxstream/host/vm_operations.h"
@@ -558,6 +561,12 @@ class FrameBuffer::Impl : public gfxstream::base::EventNotificationSupport<Frame
     int createDisplay(uint32_t displayId);
     int destroyDisplay(uint32_t displayId);
     int setDisplayColorBuffer(uint32_t displayId, uint32_t colorBuffer);
+    void notifyDisplayColorBufferChanged(uint32_t displayId, uint32_t colorBuffer);
+    void notifyColorBufferFlushed(uint32_t colorBuffer);
+    void scheduleDisplayExport(uint32_t displayId);
+    void setDisplayExportEnabled(uint32_t displayId, bool enabled);
+    void clearDisplayExportFrame(uint32_t displayId);
+    ColorBufferPtr getDisplayColorBufferForExport(uint32_t displayId);
     int getDisplayColorBuffer(uint32_t displayId, uint32_t* colorBuffer);
     int getColorBufferDisplay(uint32_t colorBuffer, uint32_t* displayId);
     int getDisplayPose(uint32_t displayId, int32_t* x, int32_t* y, uint32_t* w, uint32_t* h);
@@ -817,7 +826,9 @@ class FrameBuffer::Impl : public gfxstream::base::EventNotificationSupport<Frame
     // Treat all delayed color buffers as expired if forced=true
     void performDelayedColorBufferCloseLocked(bool forced = false);
     void eraseDelayedCloseColorBufferLocked(HandleType cb, uint64_t ts);
-
+    void retainRecentMacMuIosurfaceColorBufferLocked(HandleType colorBufferHandle,
+                                                     const ColorBufferPtr& colorBuffer);
+    ColorBufferPtr findRecentMacMuIosurfaceColorBuffer(HandleType colorBufferHandle);
     AsyncResult postImpl(HandleType p_colorbuffer, Post::CompletionCallback callback,
                          bool needLockAndBind = true, bool repaint = false);
     bool postImplSync(HandleType p_colorbuffer, bool needLockAndBind = true, bool repaint = false);
@@ -967,6 +978,16 @@ class FrameBuffer::Impl : public gfxstream::base::EventNotificationSupport<Frame
 
     Compositor* m_compositor = nullptr;
     bool m_useVulkanComposition = false;
+    // Primary HWC composition can reference a recently posted target after
+    // the guest has closed its map entry. Keep only a small working set: this
+    // preserves the compose race workaround without the former unbounded,
+    // process-lifetime retention map.
+    Post::ColorBufferRefMap m_recentMacMuIosurfaceColorBufferRefs;
+    std::deque<HandleType> m_recentMacMuIosurfaceColorBufferLru;
+    std::array<std::atomic_bool, gfxstream::host::kFrameSlotCount> m_displayExportPending{};
+    std::array<std::atomic<uint64_t>, gfxstream::host::kFrameSlotCount> m_displayExportGeneration{};
+    gfxstream::base::Lock m_displayExportRefLock;
+    std::array<ColorBufferPtr, gfxstream::host::kFrameSlotCount> m_displayExportRefs{};
 
     std::unique_ptr<vk::VkEmulation> m_emulationVk;
 
@@ -1348,6 +1369,16 @@ std::unique_ptr<FrameBuffer::Impl> FrameBuffer::Impl::Create(FrameBuffer* frameb
 
     impl->m_useVulkanComposition = impl->m_emulationVk &&
         (impl->m_features.GuestVulkanOnly.enabled() || impl->m_features.VulkanNativeSwapchain.enabled());
+    // With a GLES guest, everything (guest rendering, HWC composition, final present)
+    // must stay on the GL side: the GL->Vk ColorBuffer sync only runs on the
+    // eglSwapBuffers flush path, so buffers written through EGLImage/FBO (e.g.
+    // SurfaceFlinger client composition during app-launch and gesture transitions)
+    // never reach the Vulkan image and would present as black frames.
+    if (isIosurfaceExportEnabled() && !impl->m_useVulkanComposition) {
+        GFXSTREAM_INFO(
+            "MACMU_IOSURFACE_EXPORT keeping GL composition; final present uses the GL "
+            "IOSurface sink.");
+    }
 
     uint32_t maxApiVersion = VK_API_VERSION_1_3;
     if (impl->m_emulationVk) {
@@ -1678,7 +1709,8 @@ WorkerProcessingResult FrameBuffer::Impl::postWorkerFunc(Post& post) {
                             },
                             "Wait for post");
                     });
-            m_postWorker->post(post.cb, std::move(postCallback), post.colorTransform);
+            m_postWorker->post(post.cbRef, post.cbHandle, std::move(postCallback),
+                               post.colorTransform);
             decColorBufferRefCountNoDestroy(post.cbHandle);
             break;
         }
@@ -1708,11 +1740,25 @@ WorkerProcessingResult FrameBuffer::Impl::postWorkerFunc(Post& post) {
                     });
                 composeRequest = ToFlatComposeRequest((ComposeDevice_v2*)post.composeBuffer.data());
             }
-            m_postWorker->compose(std::move(composeRequest), std::move(composeCallback));
+            m_postWorker->compose(std::move(composeRequest), std::move(post.colorBufferRefs),
+                                  std::move(composeCallback));
             break;
         }
         case PostCmd::Clear:
             m_postWorker->clear();
+            break;
+        case PostCmd::MacMuExportDisplay:
+            {
+                const uint32_t displayId = post.exportDisplay.displayId;
+                const uint64_t generation = m_displayExportGeneration[displayId].load(
+                    std::memory_order_acquire);
+                m_postWorker->exportDisplay(displayId);
+                m_displayExportPending[displayId].store(false, std::memory_order_release);
+                if (m_displayExportGeneration[displayId].load(std::memory_order_acquire) !=
+                    generation) {
+                    scheduleDisplayExport(displayId);
+                }
+            }
             break;
         case PostCmd::Screenshot:
             m_postWorker->screenshot(
@@ -2374,6 +2420,11 @@ void FrameBuffer::Impl::performDelayedColorBufferCloseLocked(bool forced) {
     }
     m_colorBufferDelayedCloseList.erase(
                 m_colorBufferDelayedCloseList.begin(), it);
+    if (forced) {
+        AutoLock colorBufferMapLock(m_colorBufferMapLock);
+        m_recentMacMuIosurfaceColorBufferRefs.clear();
+        m_recentMacMuIosurfaceColorBufferLru.clear();
+    }
 }
 
 void FrameBuffer::Impl::eraseDelayedCloseColorBufferLocked(HandleType cb, uint64_t ts) {
@@ -2393,6 +2444,37 @@ void FrameBuffer::Impl::eraseDelayedCloseColorBufferLocked(HandleType cb, uint64
         }
         ++it;
     }
+}
+
+void FrameBuffer::Impl::retainRecentMacMuIosurfaceColorBufferLocked(
+    HandleType colorBufferHandle, const ColorBufferPtr& colorBuffer) {
+    if (!isIosurfaceExportEnabled() || colorBufferHandle == 0 || !colorBuffer) {
+        return;
+    }
+    constexpr size_t kRecentColorBufferLimit = 32;
+    const auto lruIt = std::find(m_recentMacMuIosurfaceColorBufferLru.begin(),
+                                 m_recentMacMuIosurfaceColorBufferLru.end(),
+                                 colorBufferHandle);
+    if (lruIt != m_recentMacMuIosurfaceColorBufferLru.end()) {
+        m_recentMacMuIosurfaceColorBufferLru.erase(lruIt);
+    }
+    m_recentMacMuIosurfaceColorBufferRefs[colorBufferHandle] = colorBuffer;
+    m_recentMacMuIosurfaceColorBufferLru.push_back(colorBufferHandle);
+    while (m_recentMacMuIosurfaceColorBufferLru.size() > kRecentColorBufferLimit) {
+        const HandleType evicted = m_recentMacMuIosurfaceColorBufferLru.front();
+        m_recentMacMuIosurfaceColorBufferLru.pop_front();
+        m_recentMacMuIosurfaceColorBufferRefs.erase(evicted);
+    }
+}
+
+ColorBufferPtr FrameBuffer::Impl::findRecentMacMuIosurfaceColorBuffer(
+    HandleType colorBufferHandle) {
+    if (!isIosurfaceExportEnabled() || colorBufferHandle == 0) {
+        return nullptr;
+    }
+    AutoLock colorBufferMapLock(m_colorBufferMapLock);
+    const auto it = m_recentMacMuIosurfaceColorBufferRefs.find(colorBufferHandle);
+    return it == m_recentMacMuIosurfaceColorBufferRefs.end() ? nullptr : it->second;
 }
 
 void FrameBuffer::Impl::createGraphicsProcessResources(uint64_t puid) {
@@ -2716,9 +2798,13 @@ AsyncResult FrameBuffer::Impl::postImpl(HandleType p_colorbuffer, Post::Completi
         ColorBufferMap::iterator c = m_colorbuffers.find(p_colorbuffer);
         if (c != m_colorbuffers.end()) {
             colorBuffer = c->second.cb;
+            retainRecentMacMuIosurfaceColorBufferLocked(p_colorbuffer, colorBuffer);
             c->second.refcount++;
             markOpened(&c->second);
         }
+    }
+    if (!colorBuffer) {
+        colorBuffer = findRecentMacMuIosurfaceColorBuffer(p_colorbuffer);
     }
     if (!colorBuffer) {
         return AsyncResult::FAIL_AND_CALLBACK_NOT_SCHEDULED;
@@ -2745,6 +2831,7 @@ AsyncResult FrameBuffer::Impl::postImpl(HandleType p_colorbuffer, Post::Completi
         Post postCmd;
         postCmd.cmd = PostCmd::Post;
         postCmd.cb = colorBuffer.get();
+        postCmd.cbRef = colorBuffer;
         postCmd.cbHandle = p_colorbuffer;
         postCmd.colorTransform = GetColorTransform();
         postCmd.completionCallback = std::make_unique<Post::CompletionCallback>(callback);
@@ -2752,19 +2839,33 @@ AsyncResult FrameBuffer::Impl::postImpl(HandleType p_colorbuffer, Post::Completi
         ret = AsyncResult::OK_AND_CALLBACK_SCHEDULED;
     } else {
         // If there is no sub-window, don't display anything, the client will
-        // rely on m_onPost to get the pixels instead.
+        // rely on m_onPost to get the pixels instead. MacMu headless present is
+        // the exception: route the post through the post worker so the IOSurface
+        // display sink (GL or Vk) runs on the post thread with a bound context.
+        if (m_useVulkanComposition || isIosurfaceExportEnabled()) {
+            Post postCmd;
+            postCmd.cmd = PostCmd::Post;
+            postCmd.cb = colorBuffer.get();
+            postCmd.cbRef = colorBuffer;
+            postCmd.cbHandle = p_colorbuffer;
+            postCmd.colorTransform = GetColorTransform();
+            postCmd.completionCallback = std::make_unique<Post::CompletionCallback>(callback);
+            sendPostWorkerCmd(std::move(postCmd));
+            ret = AsyncResult::OK_AND_CALLBACK_SCHEDULED;
+        } else {
 #if GFXSTREAM_ENABLE_HOST_GLES
-        if (m_displayGl) {
-            gl::DisplayGl::Post postCmd = {};
-            postCmd.frameWidth = m_windowWidth;
-            postCmd.frameHeight = m_windowHeight;
-            postCmd.layers.push_back(gl::DisplayGl::PostLayer{
-                .colorBuffer = colorBuffer.get(),
-            });
-            m_displayGl->post(postCmd).wait();
-        }
+            if (m_displayGl) {
+                gl::DisplayGl::Post postCmd = {};
+                postCmd.frameWidth = m_windowWidth;
+                postCmd.frameHeight = m_windowHeight;
+                postCmd.layers.push_back(gl::DisplayGl::PostLayer{
+                    .colorBuffer = colorBuffer.get(),
+                });
+                m_displayGl->post(postCmd).wait();
+            }
 #endif
-        ret = AsyncResult::OK_AND_CALLBACK_NOT_SCHEDULED;
+            ret = AsyncResult::OK_AND_CALLBACK_NOT_SCHEDULED;
+        }
     }
 
     //
@@ -3205,12 +3306,38 @@ AsyncResult FrameBuffer::Impl::composeWithCallback(uint32_t bufferSize, void* bu
     ComposeDevice* p = (ComposeDevice*)buffer;
     AutoLock mutex(m_lock);
 
+    auto retainColorBuffers = [this](const FlatComposeRequest& request) {
+        Post::ColorBufferRefMap colorBufferRefs;
+        auto addColorBufferRef = [this, &colorBufferRefs](HandleType colorBufferHandle) {
+            if (colorBufferHandle == 0 || colorBufferRefs.count(colorBufferHandle) != 0) {
+                return;
+            }
+            auto colorBuffer = findColorBuffer(colorBufferHandle);
+            if (!colorBuffer) {
+                colorBuffer = findRecentMacMuIosurfaceColorBuffer(colorBufferHandle);
+            }
+            if (colorBuffer) {
+                colorBufferRefs.emplace(colorBufferHandle, std::move(colorBuffer));
+            }
+        };
+
+        addColorBufferRef(request.targetHandle);
+        for (const auto& layer : request.layers) {
+            if (layer.composeMode != HWC2_COMPOSITION_SOLID_COLOR) {
+                addColorBufferRef(layer.cbHandle);
+            }
+        }
+        return colorBufferRefs;
+    };
+
     switch (p->version) {
         case 1: {
+            auto flatComposeRequest = ToFlatComposeRequest((ComposeDevice*)buffer);
             Post composeCmd;
             composeCmd.composeVersion = 1;
             composeCmd.composeBuffer.resize(bufferSize);
             memcpy(composeCmd.composeBuffer.data(), buffer, bufferSize);
+            composeCmd.colorBufferRefs = retainColorBuffers(*flatComposeRequest);
             composeCmd.completionCallback = std::make_unique<Post::CompletionCallback>(callback);
             composeCmd.cmd = PostCmd::Compose;
             sendPostWorkerCmd(std::move(composeCmd));
@@ -3226,9 +3353,11 @@ AsyncResult FrameBuffer::Impl::composeWithCallback(uint32_t bufferSize, void* bu
                 mutex.lock();
             }
             Post composeCmd;
+            auto flatComposeRequest = ToFlatComposeRequest((ComposeDevice_v2*)buffer);
             composeCmd.composeVersion = 2;
             composeCmd.composeBuffer.resize(bufferSize);
             memcpy(composeCmd.composeBuffer.data(), buffer, bufferSize);
+            composeCmd.colorBufferRefs = retainColorBuffers(*flatComposeRequest);
             composeCmd.completionCallback = std::make_unique<Post::CompletionCallback>(callback);
             composeCmd.cmd = PostCmd::Compose;
             sendPostWorkerCmd(std::move(composeCmd));
@@ -3745,6 +3874,97 @@ int FrameBuffer::Impl::destroyDisplay(uint32_t displayId) {
 int FrameBuffer::Impl::setDisplayColorBuffer(uint32_t displayId, uint32_t colorBuffer) {
     return get_gfxstream_multi_display_operations().set_display_color_buffer(displayId,
                                                                              colorBuffer);
+}
+
+void FrameBuffer::Impl::notifyDisplayColorBufferChanged(uint32_t displayId,
+                                                        uint32_t colorBuffer) {
+    if (colorBuffer == 0) {
+        return;
+    }
+    scheduleDisplayExport(displayId);
+}
+
+void FrameBuffer::Impl::scheduleDisplayExport(uint32_t displayId) {
+    if (!gfxstream::host::isIosurfaceDisplayExportEnabled(displayId)) {
+        return;
+    }
+    uint32_t colorBufferHandle = 0;
+    ColorBufferPtr colorBufferRef;
+    if (getDisplayColorBuffer(displayId, &colorBufferHandle) == 0 && colorBufferHandle != 0) {
+        colorBufferRef = findColorBuffer(colorBufferHandle);
+    }
+    {
+        AutoLock lock(m_displayExportRefLock);
+        // Bounded to one retained ColorBuffer per display. This keeps the
+        // newest binding alive until the coalesced worker consumes it without
+        // recreating the former process-lifetime, unbounded retention map.
+        m_displayExportRefs[displayId] = std::move(colorBufferRef);
+    }
+    if (!gfxstream::host::isIosurfaceDisplayExportEnabled(displayId)) {
+        AutoLock lock(m_displayExportRefLock);
+        m_displayExportRefs[displayId].reset();
+        return;
+    }
+    m_displayExportGeneration[displayId].fetch_add(1, std::memory_order_acq_rel);
+    if (m_displayExportPending[displayId].exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    Post postCmd;
+    postCmd.cmd = PostCmd::MacMuExportDisplay;
+    postCmd.exportDisplay.displayId = displayId;
+    sendPostWorkerCmd(std::move(postCmd));
+}
+
+void FrameBuffer::Impl::setDisplayExportEnabled(uint32_t displayId, bool enabled) {
+    gfxstream::host::setIosurfaceDisplayExportEnabled(displayId, enabled);
+    if (!enabled && displayId < gfxstream::host::kFrameSlotCount) {
+        AutoLock lock(m_displayExportRefLock);
+        m_displayExportRefs[displayId].reset();
+    }
+}
+
+void FrameBuffer::Impl::clearDisplayExportFrame(uint32_t displayId) {
+    if (displayId >= gfxstream::host::kFrameSlotCount) {
+        return;
+    }
+    // Disable first so queued exports cannot start a new publication while the
+    // slot lifecycle advances. A worker already doing GPU work carries the
+    // previous FrameChannel generation and will be rejected at publish time.
+    gfxstream::host::setIosurfaceDisplayExportEnabled(displayId, false);
+    {
+        AutoLock lock(m_displayExportRefLock);
+        m_displayExportRefs[displayId].reset();
+    }
+    m_displayExportGeneration[displayId].fetch_add(1, std::memory_order_acq_rel);
+    if (gfxstream::host::FrameChannel* channel =
+            gfxstream::host::FrameChannel::sharedProducer()) {
+        channel->clear(displayId);
+    }
+}
+
+ColorBufferPtr FrameBuffer::Impl::getDisplayColorBufferForExport(uint32_t displayId) {
+    if (displayId >= gfxstream::host::kFrameSlotCount) {
+        return nullptr;
+    }
+    uint32_t colorBufferHandle = 0;
+    if (getDisplayColorBuffer(displayId, &colorBufferHandle) == 0 && colorBufferHandle != 0) {
+        if (ColorBufferPtr colorBuffer = findColorBuffer(colorBufferHandle)) {
+            return colorBuffer;
+        }
+    }
+    AutoLock lock(m_displayExportRefLock);
+    return m_displayExportRefs[displayId];
+}
+
+void FrameBuffer::Impl::notifyColorBufferFlushed(uint32_t colorBuffer) {
+    if (!gfxstream::host::isIosurfaceExportEnabled() || colorBuffer == 0) {
+        return;
+    }
+    uint32_t displayId = 0;
+    if (getColorBufferDisplay(colorBuffer, &displayId) < 0) {
+        return;  // not a display-bound ColorBuffer: the common case
+    }
+    notifyDisplayColorBufferChanged(displayId, colorBuffer);
 }
 
 int FrameBuffer::Impl::getDisplayColorBuffer(uint32_t displayId, uint32_t* colorBuffer) {
@@ -5390,6 +5610,30 @@ int FrameBuffer::destroyDisplay(uint32_t displayId) { return mImpl->destroyDispl
 
 int FrameBuffer::setDisplayColorBuffer(uint32_t displayId, uint32_t colorBuffer) {
     return mImpl->setDisplayColorBuffer(displayId, colorBuffer);
+}
+
+void FrameBuffer::notifyDisplayColorBufferChanged(uint32_t displayId, uint32_t colorBuffer) {
+    mImpl->notifyDisplayColorBufferChanged(displayId, colorBuffer);
+}
+
+void FrameBuffer::notifyColorBufferFlushed(uint32_t colorBuffer) {
+    mImpl->notifyColorBufferFlushed(colorBuffer);
+}
+
+void FrameBuffer::scheduleDisplayExport(uint32_t displayId) {
+    mImpl->scheduleDisplayExport(displayId);
+}
+
+void FrameBuffer::setDisplayExportEnabled(uint32_t displayId, bool enabled) {
+    mImpl->setDisplayExportEnabled(displayId, enabled);
+}
+
+void FrameBuffer::clearDisplayExportFrame(uint32_t displayId) {
+    mImpl->clearDisplayExportFrame(displayId);
+}
+
+ColorBufferPtr FrameBuffer::getDisplayColorBufferForExport(uint32_t displayId) {
+    return mImpl->getDisplayColorBufferForExport(displayId);
 }
 
 int FrameBuffer::getDisplayColorBuffer(uint32_t displayId, uint32_t* colorBuffer) {
